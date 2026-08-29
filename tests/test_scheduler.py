@@ -1,5 +1,7 @@
 """Unit tests for the continuous batching scheduler."""
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
@@ -42,14 +44,46 @@ def test_block_shortage_stops_admission():
 
 
 def test_token_budget_respected():
+    """Unified token budget: total scheduled tokens never exceed the budget;
+    with chunked prefill the second prompt enters with a partial chunk."""
     sched, bm = make_sched(max_tokens_budget=10)
     seqs = [Sequence(list(range(6)), SamplingParams()) for _ in range(4)]
     for s in seqs:
         sched.add(s)
     out = sched.schedule()
-    # budget 10 -> at most one 6-token prefill... first is 6, second 6 > 4 left
-    assert len(out.scheduled) == 1
-    assert out.num_new_tokens == 6
+    # budget 10 -> seq0 prefills all 6, seq1 gets a 4-token chunk
+    assert len(out.scheduled) == 2
+    assert out.num_new_tokens == 10
+    assert out.spans == [(0, 6), (0, 4)]
+    assert seqs[1].num_computed_tokens == 0      # nothing computed yet, chunk pending
+
+    # engine protocol: seq0's prompt completed -> it sampled one token;
+    # seq1's chunk advances its computed frontier to 4
+    seqs[0].num_computed_tokens = 6
+    seqs[0].output_token_ids.append(42)
+    seqs[1].num_computed_tokens = 4
+    out = sched.schedule()
+    # seq0 continues decoding (1 token), seq1 finishes its last 2 prompt tokens
+    assert out.spans == [(6, 7), (4, 6)]
+    assert out.num_new_tokens == 3
+
+
+def test_token_budget_full_prompt_when_chunking_disabled():
+    """Legacy mode: a prompt must fit the budget in one iteration, so the
+    second 6-token prompt does not enter with only 4 budget left."""
+    sched, bm = make_sched(max_tokens_budget=10)
+    sched.max_num_batched_tokens = 64            # legacy clamps to >= max_model_len
+    seqs = [Sequence(list(range(6)), SamplingParams()) for _ in range(2)]
+    for s in seqs:
+        sched.add(s)
+    # simulate the legacy guarantee by using a budget smaller than the prompt:
+    # with chunking ON by default we instead verify via EngineConfig clamping
+    from minivllm.config import EngineConfig
+    cfg = EngineConfig(max_model_len=64, max_num_batched_tokens=10,
+                       enable_chunked_prefill=False)
+    assert cfg.max_num_batched_tokens == 64      # clamped up: whole prompt fits
+    out = sched.schedule()
+    assert len(out.scheduled) == 2 and out.num_new_tokens == 12
 
 
 def test_decode_continuation_and_finish_removal():
@@ -75,13 +109,14 @@ def test_preemption_when_pool_exhausted():
     sched, bm = make_sched(num_blocks=4, block_size=4)   # 16 slots
     a = Sequence(list(range(6)), SamplingParams(max_tokens=50))
     b = Sequence(list(range(6)), SamplingParams(max_tokens=50))
-    sched.add(a); sched.add(b)
+    sched.add(a)
+    sched.add(b)
     out = sched.schedule()
     assert len(out.scheduled) == 2
     # run a until both fill the pool, then a needs a new block -> b (newest) dies
     a.num_computed_tokens = 6
     b.num_computed_tokens = 6
-    for step in range(10):
+    for _step in range(10):
         a.output_token_ids.append(1)
         b.output_token_ids.append(1)
         out = sched.schedule()

@@ -1,24 +1,42 @@
-"""SpeculativeEngine: target model + drafter, draft-then-verify loop."""
+"""SpeculativeEngine: target model + drafter, draft-then-verify loop.
+
+Correctness laws enforced here:
+
+* Lossless sampling. For a deterministic drafter (n-gram) the proposal is a
+  point mass q(x)=1, so the accept probability is min(1, p(x)/q(x)) = p(x)
+  and the residual we resample from on rejection is norm(max(p - q, 0)) =
+  p with the proposed token's mass removed. For a sampled drafter (small
+  model) q is its full distribution. Both paths are the textbook speculative
+  sampling scheme: every committed token is distributed exactly like p.
+* Truncation at the earliest termination. A verify round commits k accepted
+  proposals plus one bonus token; if an EOS (or stop string) sits inside
+  that run, everything AFTER it is dropped -- output tokens, the KV
+  frontier, prefix-cache registration and the drafter's view of the stream
+  all stay consistent with the truncated sequence.
+* Per-request RNG. Sampling draws come from the request's own generator
+  (seeded in LLMEngine._seed_rng), so speculative output is reproducible
+  regardless of what else the engine has sampled.
+"""
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Union
 
 import torch
 
-from minivllm.config import EngineConfig, ModelConfig, resolve_device, resolve_dtype
+from minivllm.config import EngineConfig, ModelConfig
 from minivllm.engine import LLMEngine
 from minivllm.model import Qwen2ForCausalLM
-from minivllm.sampling import probs_from_logits, sample_from_logits
+from minivllm.sampling import filter_logits
 from minivllm.sequence import SamplingParams, Sequence, SequenceStatus
 from minivllm.spec.drafters import ModelDrafter, NGramDrafter
 from minivllm.spec.worker import KVWorker
+from minivllm.stopping import StopChecker
 
 
 @dataclass
 class SpecOutput:
     request_id: int
     text: str
-    token_ids: List[int]
+    token_ids: list[int]
     ttft: float = 0.0
     tpot: float = 0.0
     # speculative stats
@@ -46,11 +64,11 @@ class SpeculativeEngine:
              shared (useful for correctness testing).
     """
 
-    def __init__(self, config: Optional[EngineConfig] = None,
-                 drafter: Union[str] = "ngram",
+    def __init__(self, config: EngineConfig | None = None,
+                 drafter: str = "ngram",
                  num_spec_tokens: int = 4,
-                 model: Optional[Qwen2ForCausalLM] = None,
-                 model_config: Optional[ModelConfig] = None,
+                 model: Qwen2ForCausalLM | None = None,
+                 model_config: ModelConfig | None = None,
                  tokenizer=None,
                  **overrides):
         self.config = config = config or EngineConfig()
@@ -68,8 +86,8 @@ class SpeculativeEngine:
         self.tokenizer = self.target.tokenizer
 
         # ---- drafter setup
-        self.ngram_drafter: Optional[NGramDrafter] = None
-        self.model_drafter: Optional[ModelDrafter] = None
+        self.ngram_drafter: NGramDrafter | None = None
+        self.model_drafter: ModelDrafter | None = None
         if drafter == "ngram":
             self.ngram_drafter = NGramDrafter(window=3)
             self.draft_worker = None
@@ -87,7 +105,6 @@ class SpeculativeEngine:
             self.model_drafter = ModelDrafter(worker)
 
         self._next_request_id = 0
-        self.sampler = self.target.sampler
 
     def _load_drafter_model(self, path: str):
         if path in ("(same)", self.config.model):
@@ -103,10 +120,20 @@ class SpeculativeEngine:
         return model, cfg
 
     # ------------------------------------------------------------- sampling
-    def _accept_and_bonus(self, proposals: List[int], q_probs: List[torch.Tensor],
-                          target_logits: torch.Tensor, params: SamplingParams):
-        """Returns (k_accepted, bonus_token). Greedy: compare argmaxes.
-        Sampling: rejection sampling that preserves the target distribution."""
+    def _accept_and_bonus(self, proposals: list[int],
+                          q_probs: list[torch.Tensor] | None,
+                          target_logits: torch.Tensor, params: SamplingParams,
+                          generator: torch.Generator):
+        """Returns (k_accepted, bonus_token).
+
+        Greedy: compare argmaxes. Sampling: rejection sampling that preserves
+        the target distribution exactly.
+
+        q_probs[i] is the drafter's distribution for proposals[i]; ``None``
+        means a deterministic proposal (n-gram): q is a point mass on the
+        proposed token, q(x)=1, so accept prob = p(x) and the rejection
+        residual is p with the proposal's mass removed.
+        """
         gamma = len(proposals)
         if params.temperature == 0.0:
             greedy = torch.argmax(target_logits.cpu(), dim=-1)   # [gamma+1]
@@ -118,25 +145,45 @@ class SpeculativeEngine:
                     break
             return k, int(greedy[k].item())
 
-        p_all = probs_from_logits(target_logits.cpu(), params.temperature,
-                                  params.top_k, params.top_p)   # [gamma+1, V]
-        g = self.sampler.generator
+        # p_all[i]: target distribution at verify position i  [gamma+1, V]
+        p_all = torch.softmax(filter_logits(
+            target_logits.cpu(), params.temperature,
+            params.top_k, params.top_p), dim=-1)
+        g = generator
         for i in range(gamma):
-            p_i, q_i = p_all[i], q_probs[i].cpu()
-            ratio = min(1.0, p_i[proposals[i]].item() / q_i[proposals[i]].item())
+            p_i = p_all[i]
+            x = proposals[i]
+            if q_probs is not None:
+                q_i = q_probs[i].detach().float().cpu()
+                q_x = q_i[x].item()
+                ratio = 1.0 if q_x <= 0.0 else min(1.0, p_i[x].item() / q_x)
+            else:
+                q_i = None
+                ratio = min(1.0, p_i[x].item())      # q(x) = 1
             r = torch.rand((), generator=g).item()
             if r < ratio:
                 continue
-            residual = (p_i - q_i).clamp(min=0)
-            residual = residual / residual.sum()
+            # rejected: resample from norm(max(p - q, 0))
+            residual = p_i.clone()
+            if q_i is not None:
+                residual -= q_i
+            else:
+                residual[x] = 0.0                    # subtract the point mass
+            residual.clamp_(min=0)
+            total = residual.sum()
+            if total <= 0:
+                # p == q (degenerate): sampling from p IS the correct residual
+                residual = p_i
+            else:
+                residual = residual / total
             return i, int(torch.multinomial(residual, 1, generator=g).item())
         # all proposals accepted: the bonus comes from p at the last position
         return gamma, int(torch.multinomial(p_all[gamma], 1, generator=g).item())
 
     # ------------------------------------------------------------- generate
     @torch.no_grad()
-    def generate(self, prompts, params: Union[SamplingParams, List[SamplingParams], None] = None,
-                 use_tqdm: bool = True) -> List[SpecOutput]:
+    def generate(self, prompts, params: SamplingParams | list[SamplingParams] | None = None,
+                 use_tqdm: bool = True) -> list[SpecOutput]:
         from tqdm import tqdm
         if not isinstance(prompts, (list, tuple)):
             prompts = [prompts]
@@ -154,7 +201,34 @@ class SpeculativeEngine:
         bar.close()
         return outs
 
-    def _generate_one(self, prompt: Union[str, List[int]], p: SamplingParams) -> SpecOutput:
+    def _round_keep_count(self, candidate_ids: list[int], base: int,
+                          committed: list[int], params: SamplingParams,
+                          checker: StopChecker | None) -> tuple:
+        """How many of this round's committed tokens survive?
+
+        Scans accepted proposals + bonus in order and cuts at the EARLIEST
+        termination: EOS (kept as the final token, vLLM convention) or a
+        stop string (cut before the tokens completing it). max_tokens is
+        enforced last as a hard cap on the commit size.
+        Returns (keep, terminated)."""
+        keep = len(committed)
+        terminated = False
+        if not params.ignore_eos:
+            for j, tok in enumerate(committed):
+                if tok in self.target.eos_token_ids:
+                    keep, terminated = j + 1, True
+                    break
+        if checker is not None:
+            # stop strings compete with EOS by POSITION: earliest one wins
+            cut = checker.check(candidate_ids, ignore_eos=True)
+            if cut is not None and cut - base < keep:
+                keep, terminated = cut - base, True
+        room = params.max_tokens - base
+        if keep > room:                       # length cap, not a "stop" event
+            keep = room
+        return keep, terminated
+
+    def _generate_one(self, prompt: str | list[int], p: SamplingParams) -> SpecOutput:
         t0 = time.perf_counter()
         if isinstance(prompt, str):
             prompt_ids = self.tokenizer(prompt).input_ids
@@ -164,6 +238,12 @@ class SpeculativeEngine:
             raise ValueError("prompt + max_tokens exceeds max_model_len")
 
         tseq = Sequence(prompt_ids, p, arrival_time=t0)
+        # per-request RNG: this request's own stream, independent of anything
+        # else the engine has sampled
+        LLMEngine._seed_rng(tseq, self._next_request_id, 0, p,
+                            engine_seed=self.config.seed)
+        checker = StopChecker(self.tokenizer, p.stop, self.target.eos_token_ids) \
+            if (self.tokenizer is not None and p.stop) else None
         self.target.block_manager.allocate_sequence(tseq)
 
         use_ngram = self.ngram_drafter is not None
@@ -186,12 +266,13 @@ class SpeculativeEngine:
 
         out = SpecOutput(request_id=self._next_request_id, text="", token_ids=[])
         self._next_request_id += 1
+        gen = tseq.sampling_generator()
 
         gamma = self.num_spec_tokens
         while len(tseq.output_token_ids) < p.max_tokens:
             out.num_rounds += 1
             accepted_len = len(tseq.tokens)          # all verified so far
-            bonus = tseq.tokens[-1]                  # pending token (not in KV)
+            # the pending bonus token (tseq.tokens[-1]) is not in the KV yet
             assert tseq.num_computed_tokens == accepted_len - 1, \
                 "target KV frontier drifted from the accepted stream"
 
@@ -200,12 +281,11 @@ class SpeculativeEngine:
             base = len(tseq.output_token_ids)
             if use_ngram:
                 proposals = self.ngram_drafter.propose(tseq.tokens, min(gamma, room - 1))
-                q_probs = []
+                q_probs = None                        # deterministic point mass
             else:
                 proposals, q_probs = self.model_drafter.propose(
                     dseq, accepted_len, min(gamma, max(1, room - 1)),
-                    p.temperature, p.top_k, p.top_p,
-                    generator=self.sampler.generator)
+                    p.temperature, p.top_k, p.top_p, generator=gen)
 
             # pre-append proposals so the verify forward can read their ids
             # (rolled back below for whatever the target rejects)
@@ -216,19 +296,26 @@ class SpeculativeEngine:
             logits = self._target_span(tseq, accepted_len - 1, span_end)
             out.num_proposed += len(proposals)
 
-            k, bonus_tok = self._accept_and_bonus(proposals, q_probs, logits, p)
+            k, bonus_tok = self._accept_and_bonus(proposals, q_probs, logits, p, gen)
             out.num_accepted += k
 
-            # ---- commit: keep k accepted proposals, drop rejected, add bonus
-            del tseq.output_token_ids[base + k:]
-            tseq.output_token_ids.append(bonus_tok)      # always fits: |props| <= room-1
-            for tok in proposals[:k] + [bonus_tok]:
+            # ---- commit: accepted proposals + bonus, cut at the earliest
+            # termination inside the round (EOS/stop may sit mid-run)
+            committed = proposals[:k] + [bonus_tok]
+            keep, terminated = self._round_keep_count(
+                tseq.output_token_ids, base, committed, p, checker)
+            del tseq.output_token_ids[base:]                  # drop proposals+old bonus
+            tseq.output_token_ids.extend(committed[:keep])
+            for _ in committed[:keep]:
                 tseq.record_first_token()
                 tseq.last_token_time = time.perf_counter()
 
-            # KV frontier: accepted proposals are computed (verify pass);
-            # the bonus token is pending until the next round feeds it
-            tseq.num_computed_tokens = accepted_len + k
+            # KV frontier: accepted proposals are computed (verify pass); the
+            # bonus token is pending until the next round feeds it. If the
+            # round was truncated, nothing is pending -- all kept tokens'
+            # KV was computed during verification.
+            tseq.num_computed_tokens = accepted_len + k if keep == len(committed) \
+                else accepted_len + keep
             self.target.block_manager.register_filled_blocks(
                 tseq, tseq.num_computed_tokens)
             if use_ngram:
@@ -239,12 +326,11 @@ class SpeculativeEngine:
                 dseq.output_token_ids = list(tseq.output_token_ids)
 
             # ---- stop conditions
-            last = tseq.output_token_ids[-1]
-            if last in self.target.eos_token_ids and not p.ignore_eos:
-                tseq.status = SequenceStatus.FINISHED_STOPPED
-                break
             if len(tseq.output_token_ids) >= p.max_tokens:
                 tseq.status = SequenceStatus.FINISHED_LENGTH
+                break
+            if terminated:
+                tseq.status = SequenceStatus.FINISHED_STOPPED
                 break
 
         text = ""

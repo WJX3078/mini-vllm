@@ -7,16 +7,20 @@ The forward pass is written for continuous batching:
   * attention is computed per sequence through its block table,
   * only the positions whose logits are needed go through lm_head.
 """
-import math
-from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minivllm.attention import (SeqInput, _sdpa, apply_rope, gather_kv,
-                                paged_attention, rope_inv_freq,
-                                write_kv_to_pool)
+from minivllm.attention import (
+    SeqInput,
+    _sdpa,
+    apply_rope,
+    gather_kv,
+    paged_attention,
+    rope_inv_freq,
+    write_kv_to_pool,
+)
 from minivllm.config import ModelConfig
 
 
@@ -66,7 +70,7 @@ class Qwen2ForCausalLM(nn.Module):
             torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=dtype, device=device))
         self.layers = nn.ModuleList(Qwen2Layer(cfg, dtype, device) for _ in range(cfg.num_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
-        self.lm_head: Optional[nn.Parameter] = None
+        self.lm_head: nn.Parameter | None = None
         if not cfg.tie_word_embeddings:
             self.lm_head = nn.Parameter(torch.empty(cfg.vocab_size, cfg.hidden_size,
                                                     dtype=dtype, device=device))
@@ -139,7 +143,7 @@ class Qwen2ForCausalLM(nn.Module):
         return table_t
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
-                pool, seq_inputs: List[SeqInput],
+                pool, seq_inputs: list[SeqInput],
                 logits_indices: torch.Tensor) -> torch.Tensor:
         """input_ids/positions: [T] flat over all sequences' new tokens.
         logits_indices: [S] flat token indices whose logits we need.
@@ -151,7 +155,7 @@ class Qwen2ForCausalLM(nn.Module):
 
         # all-decode fast path: 1 new token per sequence -> the whole batch's
         # KV write + gather + attention collapses into single batched ops
-        all_decode = T == len(seq_inputs) and all(si.q_len == 1 for si in seq_inputs)
+        all_decode = len(seq_inputs) == T and all(si.q_len == 1 for si in seq_inputs)
         table_t = phys = slots = max_ctx = None
         if all_decode:
             table_t = self._decode_batch_context(pool, seq_inputs)

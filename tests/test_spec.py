@@ -1,12 +1,18 @@
 """Tests for speculative decoding: drafters, verify loop, distribution law."""
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import torch
+from helpers import (
+    make_tiny_spec_engine,
+    random_prompts,
+    run_hf_greedy,
+    run_spec_greedy,
+)
 
-from helpers import (make_tiny_spec_engine, random_prompts, run_hf_greedy,
-                     run_spec_greedy, TINY)
 from minivllm.spec.drafters import NGramDrafter
 
 
@@ -40,7 +46,6 @@ def test_rejection_sampling_preserves_target_distribution():
     """With proposals drawn from q, the committed token distribution must be
     exactly p -- the core correctness law of speculative decoding."""
     from minivllm.sequence import SamplingParams
-    from minivllm.spec.spec_engine import SpeculativeEngine
 
     eng, _ = make_tiny_spec_engine(seed=0, drafter="ngram")
     p = torch.tensor([0.7, 0.3])
@@ -49,11 +54,12 @@ def test_rejection_sampling_preserves_target_distribution():
     params = SamplingParams(temperature=1.0, max_tokens=8)
 
     torch.manual_seed(42)
+    gen = torch.Generator().manual_seed(1234)
     counts = torch.zeros(2)
     trials = 20000
     for _ in range(trials):
         d0 = int(torch.multinomial(q, 1).item())
-        k, bonus = eng._accept_and_bonus([d0], [q], logits, params)
+        k, bonus = eng._accept_and_bonus([d0], [q], logits, params, gen)
         committed = [d0] * k + [bonus]
         counts[committed[0]] += 1
     empirical = counts / trials

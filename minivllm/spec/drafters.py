@@ -8,9 +8,13 @@
 * ModelDrafter  -- a full (small) language model driven through the same
   paged-KV worker machinery as the target.
 """
-from typing import List, Optional, Tuple
+
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:  # type-checking only; avoids a runtime import cycle
+    from minivllm.spec.worker import KVWorker
 
 
 class NGramDrafter:
@@ -30,7 +34,7 @@ class NGramDrafter:
         self.table.clear()
         self._synced = 0
 
-    def sync(self, tokens: List[int]):
+    def sync(self, tokens: list[int]):
         """Track the accepted context (stream only ever grows)."""
         w = self.window
         first = max(0, self._synced - w + 1)
@@ -38,7 +42,7 @@ class NGramDrafter:
             self.table.setdefault(tuple(tokens[i:i + w]), []).append(i)
         self._synced = len(tokens)
 
-    def propose(self, tokens: List[int], gamma: int) -> List[int]:
+    def propose(self, tokens: list[int], gamma: int) -> list[int]:
         """Up to `gamma` tokens that followed the current suffix last time."""
         w = self.window
         if len(tokens) < w or gamma <= 0:
@@ -67,8 +71,8 @@ class ModelDrafter:
     @torch.no_grad()
     def propose(self, seq, context_len: int, gamma: int,
                 temperature: float = 0.0, top_k: int = -1, top_p: float = 1.0,
-                generator: Optional[torch.Generator] = None
-                ) -> Tuple[List[int], List[torch.Tensor]]:
+                generator: torch.Generator | None = None
+                ) -> tuple[list[int], list[torch.Tensor]]:
         """Draft gamma tokens conditioned on tokens[0:context_len).
 
         KV sync: make the draft's computed frontier exactly context_len-1,
@@ -85,8 +89,8 @@ class ModelDrafter:
         elif seq.num_computed_tokens < frontier:
             w.forward_span(seq, seq.num_computed_tokens, frontier)
 
-        tokens: List[int] = []
-        probs: List[torch.Tensor] = []
+        tokens: list[int] = []
+        probs: list[torch.Tensor] = []
         # logits at position frontier-1 give the first proposal (position frontier)
         logits = w.forward_span(seq, frontier, context_len)[-1]
         for i in range(gamma):

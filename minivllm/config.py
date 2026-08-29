@@ -1,6 +1,6 @@
 """Engine / model configuration and KV-cache size math."""
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import AutoConfig
@@ -16,20 +16,25 @@ class EngineConfig:
 
     # Paged KV cache
     block_size: int = 16           # tokens per physical KV block
-    num_blocks: Optional[int] = None          # override pool size (in blocks)
+    num_blocks: int | None = None          # override pool size (in blocks)
     gpu_memory_utilization: float = 0.75      # fraction of VRAM for weights+KV+activations
 
-    # Scheduler (continuous batching)
+    # Scheduler (continuous batching + chunked prefill)
     max_num_seqs: int = 16                    # max sequences in a batch
     max_model_len: int = 1024                 # max tokens per sequence (prompt + output)
-    max_num_batched_tokens: int = 2048        # max new tokens processed per engine step
+    max_num_batched_tokens: int = 2048        # token budget per engine step, shared by
+                                              # decode tokens + prefill chunks
+    enable_chunked_prefill: bool = True       # False = legacy: a whole prompt must fit
+                                              # in one scheduling iteration
 
     enable_prefix_caching: bool = True
+    hash_backend: str = "tuple"               # prefix-cache key backend: "tuple" | "sha256"
     seed: int = 1234
 
     def __post_init__(self):
-        if self.max_num_batched_tokens < self.max_model_len:
-            # A whole prompt must fit in one scheduling budget (no chunked prefill).
+        if not self.enable_chunked_prefill and \
+                self.max_num_batched_tokens < self.max_model_len:
+            # legacy mode: a whole prompt must fit in one scheduling budget
             self.max_num_batched_tokens = self.max_model_len
 
 
@@ -70,7 +75,7 @@ class ModelConfig:
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = True
     attention_bias: bool = False
-    eos_token_id: Optional[int] = None
+    eos_token_id: int | None = None
 
     @classmethod
     def from_pretrained(cls, model_path: str) -> "ModelConfig":

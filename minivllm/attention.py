@@ -12,7 +12,6 @@ scattered across those blocks; attention:
 Production vLLM swaps steps (1)(2)(3) for a single fused CUDA kernel that
 walks the block table; the memory layout and semantics here are the same.
 """
-from typing import List
 
 import torch
 import torch.nn.functional as F

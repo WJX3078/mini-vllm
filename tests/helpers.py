@@ -5,7 +5,8 @@ speculative decoding) against HuggingFace reference outputs without
 downloading any model.
 """
 import torch
-from transformers import Qwen2Config, Qwen2ForCausalLM as HFQwen2ForCausalLM
+from transformers import Qwen2Config
+from transformers import Qwen2ForCausalLM as HFQwen2ForCausalLM
 
 from minivllm.config import EngineConfig, ModelConfig
 from minivllm.engine import LLMEngine

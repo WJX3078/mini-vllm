@@ -16,3 +16,8 @@ HF_HOME/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# packaging
+*.egg-info/
+build/
+dist/

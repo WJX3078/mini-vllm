@@ -1,100 +1,199 @@
-"""Benchmark: mini-vllm (paged KV + continuous batching + prefix caching)
-vs HuggingFace `model.generate`.
+"""Benchmark: mini-vllm vs HuggingFace (and vLLM when installed).
+
+Methodology (what makes these numbers trustworthy)
+--------------------------------------------------
+* CUDA is synchronized before/after every timed region; wall time is real
+  GPU-completed time, not kernel-launch time.
+* Every configuration runs WARMUP runs first (default 3), then MEASURED
+  runs (default 5). Reported throughput is the MEDIAN across measured runs;
+  TTFT / TPOT / E2E percentiles (p50/p95/p99) pool all measured requests.
+* Fairness: both engines see IDENTICAL token-id prompts, the same
+  tokenizer, dtype, device, sampling params and output length. By default
+  the benchmark runs greedy with ignore_eos on BOTH sides so every request
+  generates exactly `output_len` tokens (wall-clock is then a pure engine
+  comparison; EOS behavior is workload-controlled, not engine-controlled).
+* HF latency is measured with a custom generation loop (use_cache), so TTFT
+  is the real first forward step and TPOT the real per-step time -- not
+  batch_latency / num_tokens. For batched HF runs, TTFT is the batch's
+  first step (shared by the batch members) and is flagged as approximate.
+* vLLM baseline is used only if `import vllm` works; otherwise it is
+  skipped with a note (the benchmark never hard-depends on it).
 
 Metrics
 -------
-* throughput   : total generated tokens / wall time (all requests)
-* TTFT         : time from request arrival to its first generated token
-* TPOT         : (t_last - t_first) / (num_output_tokens - 1) per request
-* cache hit %  : prefix-cache hits / lookups (mini-vllm only)
-
-Methodology notes
------------------
-HF batched generate() gives every request in a batch the same schedule, so
-per-request TTFT is not meaningful there; we report batch-level latency for
-the HF baseline and true per-request TTFT/TPOT for mini-vllm. For a fair
-single-stream comparison run both with --batch-size 1.
+throughput tok/s, requests/s, TTFT / TPOT / E2E (mean, p50, p95, p99),
+prefix-cache hit rate, preemptions, peak KV blocks + utilization (mini-vllm);
+acceptance rate / tokens per round / speedup (speculative mode).
 """
 import argparse
 import json
 import random
+import statistics
 import time
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
 
 import torch
 
 
 # ----------------------------------------------------------------- workload
-def build_text_workload(num_prompts: int, input_len: int,
-                        shared_prefix_len: int, seed: int = 0):
-    """Text prompts: a shared system prefix + random suffix words."""
-    rng = random.Random(seed)
-    words = ["alpha", "beta", "gamma", "delta", "omega", "kappa", "sigma",
-             "epsilon", "theta", "lambda", "zeta", "tau", "rho", "psi"]
-    prefix = " ".join(rng.choice(words) for _ in range(shared_prefix_len))
+@dataclass
+class Workload:
+    num_prompts: int
+    input_len: int
+    output_len: int
+    shared_prefix_ratio: float = 0.0
+    seed: int = 0
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = -1
+    concurrency: int = 8           # mini-vllm max in-flight requests
+    base_seed: int = 1234          # per-request RNG seed: base_seed + i
+
+
+@dataclass
+class BenchResult:
+    engine: str
+    wall_time: float
+    num_requests: int
+    total_output_tokens: int
+    ttfts: list[float] = field(default_factory=list)
+    tpots: list[float] = field(default_factory=list)
+    e2es: list[float] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)
+    approximate: dict = field(default_factory=dict)
+
+    @property
+    def throughput(self) -> float:
+        return self.total_output_tokens / self.wall_time if self.wall_time else 0.0
+
+    @property
+    def requests_per_s(self) -> float:
+        return self.num_requests / self.wall_time if self.wall_time else 0.0
+
+
+def build_token_workload(tok, wl: Workload):
+    """Token-id prompts: a shared prefix (ratio * input_len tokens from a
+    fixed random pool) + per-request random suffix. Building at token level
+    guarantees both engines see byte-identical inputs."""
+    rng = random.Random(wl.seed)
+    vocab_hint = getattr(tok, "vocab_size", 32000) or 32000
+    safe_max = min(vocab_hint - 1, 30000)
+    shared_len = int(wl.input_len * wl.shared_prefix_ratio)
+    shared = [rng.randrange(100, safe_max) for _ in range(shared_len)]
     prompts = []
-    for _ in range(num_prompts):
-        suffix_len = max(1, input_len - shared_prefix_len)
-        suffix = " ".join(rng.choice(words) for _ in range(suffix_len))
-        prompts.append((prefix + " " + suffix).strip() if prefix else suffix)
+    for _ in range(wl.num_prompts):
+        suffix = [rng.randrange(100, safe_max)
+                  for _ in range(wl.input_len - shared_len)]
+        prompts.append(shared + suffix)
     return prompts
 
 
 # ------------------------------------------------------------------ metrics
-@dataclass
-class BenchResult:
-    name: str
-    wall_time: float
-    num_requests: int
-    total_output_tokens: int
-    ttfts: List[float]
-    tpots: List[float]
-    extra: dict
+def pct(xs: list[float], p: float) -> float:
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))]
 
-    def summary(self) -> str:
-        def pct(xs, p):
-            if not xs:
-                return float("nan")
-            xs = sorted(xs)
-            return xs[min(len(xs) - 1, int(len(xs) * p))]
 
-        thr = self.total_output_tokens / self.wall_time
-        mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
-        lines = [
-            f"[{self.name}] requests={self.num_requests} "
-            f"out_tokens={self.total_output_tokens} wall={self.wall_time:.2f}s",
-            f"  throughput      : {thr:.1f} tok/s",
-            f"  TTFT  mean/p50/p99: {mean(self.ttfts)*1000:.1f} / "
-            f"{pct(self.ttfts, .5)*1000:.1f} / {pct(self.ttfts, .99)*1000:.1f} ms",
-            f"  TPOT  mean/p50/p99: {mean(self.tpots)*1000:.1f} / "
-            f"{pct(self.tpots, .5)*1000:.1f} / {pct(self.tpots, .99)*1000:.1f} ms",
-        ]
-        for k, v in self.extra.items():
+def dist(xs: list[float]) -> dict:
+    if not xs:
+        return {"mean": float("nan"), "p50": float("nan"),
+                "p95": float("nan"), "p99": float("nan")}
+    return {"mean": statistics.fmean(xs), "p50": pct(xs, 50),
+            "p95": pct(xs, 95), "p99": pct(xs, 99)}
+
+
+def fmt_ms(x: float) -> str:
+    return f"{x * 1000:.1f}"
+
+
+def result_to_json(r: BenchResult, wl: Workload, model: str, device: str,
+                   dtype: str) -> dict:
+    return {
+        "engine": r.engine,
+        "model": model,
+        "device": device,
+        "dtype": dtype,
+        "workload": {
+            "num_prompts": wl.num_prompts, "input_len": wl.input_len,
+            "output_len": wl.output_len,
+            "shared_prefix_ratio": wl.shared_prefix_ratio,
+            "temperature": wl.temperature, "top_p": wl.top_p,
+            "top_k": wl.top_k, "seed": wl.seed,
+            "ignore_eos": True,
+        },
+        "throughput_tok_s": round(r.throughput, 2),
+        "requests_s": round(r.requests_per_s, 3),
+        "wall_time_s": round(r.wall_time, 3),
+        "ttft": {k: round(v * 1000, 2) for k, v in dist(r.ttfts).items()},
+        "tpot": {k: round(v * 1000, 3) for k, v in dist(r.tpots).items()},
+        "e2e": {k: round(v * 1000, 2) for k, v in dist(r.e2es).items()},
+        "prefix_cache": r.extra.get("prefix_cache"),
+        "kv_cache": r.extra.get("kv_cache"),
+        "preemptions": r.extra.get("preemptions"),
+        "approximate": r.approximate or None,
+        "extra": {k: v for k, v in r.extra.items()
+                  if k not in ("prefix_cache", "kv_cache", "preemptions")},
+    }
+
+
+def print_result(r: BenchResult):
+    d_t, d_p, d_e = dist(r.ttfts), dist(r.tpots), dist(r.e2es)
+    lines = [
+        f"[{r.engine}] requests={r.num_requests} "
+        f"out_tokens={r.total_output_tokens} wall={r.wall_time:.2f}s",
+        f"  throughput : {r.throughput:.1f} tok/s | {r.requests_per_s:.2f} req/s",
+        f"  TTFT ms    : mean {fmt_ms(d_t['mean'])} | p50 {fmt_ms(d_t['p50'])}"
+        f" | p95 {fmt_ms(d_t['p95'])} | p99 {fmt_ms(d_t['p99'])}",
+        f"  TPOT ms    : mean {fmt_ms(d_p['mean'])} | p50 {fmt_ms(d_p['p50'])}"
+        f" | p95 {fmt_ms(d_p['p95'])} | p99 {fmt_ms(d_p['p99'])}",
+        f"  E2E   s    : mean {d_e['mean']:.2f} | p50 {d_e['p50']:.2f}"
+        f" | p95 {d_e['p95']:.2f} | p99 {d_e['p99']:.2f}",
+    ]
+    for k, v in r.extra.items():
+        if k not in ("prefix_cache", "kv_cache"):
             lines.append(f"  {k:<15} : {v}")
-        return "\n".join(lines)
+    if "prefix_cache" in r.extra and r.extra["prefix_cache"]:
+        pc = r.extra["prefix_cache"]
+        lines.append(f"  prefix cache    : hit {pc['hit_rate']:.1%} "
+                     f"({pc['hits']}/{pc['queries']})")
+    if "kv_cache" in r.extra and r.extra["kv_cache"]:
+        kv = r.extra["kv_cache"]
+        lines.append(f"  kv cache        : peak {kv['peak_blocks']}/"
+                     f"{kv['total_blocks']} blocks ({kv['utilization']:.1%} at end)")
+    for k, v in r.approximate.items():
+        lines.append(f"  ~ {k}: {v}")
+    print("\n".join(lines))
 
 
-def result_from_engine(name, outputs, wall_time, extra=None):
-    ttfts, tpots, total = [], [], 0
-    for out in outputs:
-        for o in out.outputs:
-            ttfts.append(o["ttft"])
-            tpots.append(o["tpot"])
-            total += len(o["token_ids"])
-    return BenchResult(name, wall_time, len(outputs), total, ttfts, tpots,
-                       extra or {})
+def merge_runs(results: list[BenchResult], name: str) -> BenchResult:
+    """Median wall time across runs; latency percentiles pooled over all
+    measured requests of all runs."""
+    med_wall = statistics.median(r.wall_time for r in results)
+    ttfts = [x for r in results for x in r.ttfts]
+    tpots = [x for r in results for x in r.tpots]
+    e2es = [x for r in results for x in r.e2es]
+    base = results[0]
+    thr = [r.total_output_tokens / r.wall_time for r in results]
+    return BenchResult(
+        engine=name, wall_time=med_wall, num_requests=base.num_requests,
+        total_output_tokens=int(statistics.median(
+            r.total_output_tokens for r in results)),
+        ttfts=ttfts, tpots=tpots, e2es=e2es,
+        extra={**base.extra, "throughput_runs": [round(t, 1) for t in thr],
+               "throughput_median": round(statistics.median(thr), 1)},
+        approximate=base.approximate)
 
 
-# ----------------------------------------------------------------- runners
-def generate_staggered(engine, prompts, params, max_in_flight):
+# ------------------------------------------------------------- mini-vllm
+def generate_staggered(engine, prompts, params_list, max_in_flight):
     """Drive the engine with at most `max_in_flight` unfinished requests,
-    adding the next one whenever a slot frees up. Emulates realistic request
-    arrivals (requests land in different scheduling rounds, so prefix caching
-    gets a chance to hit, unlike one synchronous submit)."""
+    adding the next one whenever a slot frees up (realistic arrivals: later
+    requests land in different scheduling rounds, so prefix caching can
+    hit)."""
     results = {}
-    inflight = 0
-    next_to_add = 0
+    inflight, next_to_add = 0, 0
     n = len(prompts)
 
     def merge(out):
@@ -105,116 +204,269 @@ def generate_staggered(engine, prompts, params, max_in_flight):
             prev.outputs.extend(out.outputs)
 
     while next_to_add < n and inflight < max_in_flight:
-        engine.add_request(prompts[next_to_add], params)
-        inflight += 1
-        next_to_add += 1
+        engine.add_request(prompts[next_to_add], params_list[next_to_add])
+        inflight, next_to_add = inflight + 1, next_to_add + 1
     while engine.scheduler.has_unfinished():
         for out in engine.step():
             merge(out)
             inflight -= 1
         while inflight < max_in_flight and next_to_add < n:
-            engine.add_request(prompts[next_to_add], params)
-            inflight += 1
-            next_to_add += 1
+            engine.add_request(prompts[next_to_add], params_list[next_to_add])
+            inflight, next_to_add = inflight + 1, next_to_add + 1
     return [results[i] for i in sorted(results)]
 
 
-def run_mini_vllm(model_path, prompts, max_tokens, temperature, max_num_seqs,
-                  block_size, enable_prefix_caching, device, dtype,
-                  max_in_flight=8):
-    from minivllm import EngineConfig, LLMEngine, SamplingParams
+def _params_for(wl: Workload):
+    from minivllm import SamplingParams
+    return [SamplingParams(
+        temperature=wl.temperature, top_p=wl.top_p, top_k=wl.top_k,
+        max_tokens=wl.output_len, ignore_eos=True, seed=wl.base_seed + i)
+        for i in range(wl.num_prompts)]
+
+
+def run_mini_vllm_once(model_path, prompts, wl: Workload, device, dtype_str,
+                       max_num_seqs, block_size, enable_prefix_caching,
+                       max_in_flight, max_model_len) -> BenchResult:
+    from minivllm import EngineConfig, LLMEngine
 
     engine = LLMEngine(EngineConfig(
-        model=model_path, device=device, dtype=str(dtype).split(".")[-1],
+        model=model_path, device=device, dtype=dtype_str,
         block_size=block_size, max_num_seqs=max_num_seqs,
-        max_model_len=4096, max_num_batched_tokens=4096,
-        enable_prefix_caching=enable_prefix_caching))
-    params = SamplingParams(temperature=temperature, max_tokens=max_tokens,
-                            ignore_eos=True)
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max(2048, max_model_len),
+        enable_prefix_caching=enable_prefix_caching,
+        enable_chunked_prefill=True))
+    params = _params_for(wl)
+    if device == "cuda":
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     outputs = generate_staggered(engine, prompts, params, max_in_flight)
+    if device == "cuda":
+        torch.cuda.synchronize()
     wall = time.perf_counter() - t0
+
+    ttfts, tpots, e2es, total = [], [], [], 0
+    for out in outputs:
+        for o in out.outputs:
+            ttfts.append(o["ttft"])
+            tpots.append(o["tpot"])
+            e2es.append(o.get("e2e", o["ttft"]))
+            total += len(o["token_ids"])
     stats = engine.engine_stats()
     extra = {
-        "cache_hit_rate": f"{stats['cache_hit_rate']:.1%}",
+        "prefix_cache": {"hit_rate": stats["cache_hit_rate"],
+                         "hits": stats["cache_hits"],
+                         "queries": stats["cache_queries"]},
+        "kv_cache": {"peak_blocks": stats["peak_blocks"],
+                     "total_blocks": engine.block_manager.num_blocks,
+                     "utilization": stats["kv_utilization"]},
         "preemptions": stats["preemptions"],
         "cow_copies": stats["cow_copies"],
-        "peak_blocks": f"{stats['peak_blocks']}/{engine.block_manager.num_blocks}",
     }
-    result = result_from_engine("mini-vllm", outputs, wall, extra)
     del engine
-    return result
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return BenchResult("mini-vllm", wall, len(outputs), total, ttfts, tpots,
+                       e2es, extra)
 
 
-def run_hf(model_path, prompts, max_tokens, temperature, batch_size, device, dtype):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+# ---------------------------------------------------------------- HuggingFace
+@torch.no_grad()
+def hf_generate_profiled(model, batch_ids, wl: Workload, device,
+                         ignore_eos: bool):
+    """Custom HF generation loop: REAL TTFT (completion of the first
+    forward) and per-step TPOT, same sampling params + ignore_eos semantics
+    as mini-vllm. Returns per-request (ttft, tpot, e2e, n_tokens).
 
-    tok = AutoTokenizer.from_pretrained(model_path)
+    With batch_size > 1 the first forward is shared by the whole batch, so
+    per-request TTFT is flagged approximate; with batch_size == 1 it is
+    exact."""
+    from minivllm.sampling import sample_from_logits
+
+    gens = [torch.Generator().manual_seed(wl.base_seed + i)
+            for i in range(len(batch_ids))]
+    cfg_eos = model.config.eos_token_id
+    eos_ids = set(cfg_eos) if isinstance(cfg_eos, list) else {cfg_eos}
+
+    input_ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    past = None
+    finished = [False] * len(batch_ids)
+    first_t = [None] * len(batch_ids)
+    last_t = [None] * len(batch_ids)
+    n_out = [0] * len(batch_ids)
+
+    gen_start = time.perf_counter()
+    cur = input_ids
+    for _step in range(wl.output_len):
+        if device == "cuda":
+            torch.cuda.synchronize()
+        out = model(cur, attention_mask=attention_mask,
+                    past_key_values=past, use_cache=True)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t_done = time.perf_counter()
+        past = out.past_key_values
+
+        logits = out.logits[:, -1, :].float()
+        next_ids, any_active = [], False
+        for i in range(len(batch_ids)):
+            if finished[i]:
+                next_ids.append(eos_ids and min(eos_ids))
+                continue
+            any_active = True
+            tok_i = sample_from_logits(logits[i], wl.temperature, wl.top_k,
+                                       wl.top_p, generator=gens[i])
+            next_ids.append(tok_i)
+            if first_t[i] is None:
+                first_t[i] = t_done       # real first-token availability
+            last_t[i] = t_done
+            n_out[i] += 1
+            if not ignore_eos and tok_i in eos_ids:
+                finished[i] = True
+        cur = torch.tensor(next_ids, dtype=torch.long, device=device)[:, None]
+        attention_mask = torch.cat(
+            [attention_mask,
+             torch.ones((len(batch_ids), 1), dtype=torch.long,
+                        device=device)], dim=1)
+        if not any_active:
+            break
+
+    res = []
+    for i in range(len(batch_ids)):
+        ttft = first_t[i] - gen_start if first_t[i] is not None else 0.0
+        tpot = ((last_t[i] - first_t[i]) / (n_out[i] - 1)
+                if n_out[i] > 1 else 0.0)
+        e2e = last_t[i] - gen_start if last_t[i] is not None else 0.0
+        res.append((ttft, tpot, e2e, n_out[i]))
+    return res
+
+
+def run_hf_once(model_path, prompts, wl: Workload, device, dtype,
+                batch_size, ignore_eos: bool = True) -> BenchResult:
+    from transformers import AutoModelForCausalLM
+
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
     model.to(device).eval()
-    pad_id = tok.pad_token_id or tok.eos_token_id
 
-    ttfts, tpots, total = [], [], 0
+    ttfts, tpots, e2es, total = [], [], [], 0
+    if device == "cuda":
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     for i in range(0, len(prompts), batch_size):
-        batch = prompts[i:i + batch_size]
-        enc = tok(batch, return_tensors="pt", padding=True, padding_side="left")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        input_len = enc["input_ids"].shape[1]
-        gen_kwargs = dict(max_new_tokens=max_tokens, do_sample=temperature > 0,
-                          pad_token_id=pad_id)
-        if temperature > 0:
-            gen_kwargs["temperature"] = temperature
-        t_batch = time.perf_counter()
-        out = model.generate(**enc, **gen_kwargs)
-        t_batch = time.perf_counter() - t_batch
-        n = len(batch)
-        # batch-level latency split: TTFT ~ 1 step, TPOT ~ the rest
-        gen_len = out.shape[1] - input_len
-        total += gen_len * n
-        approx_ttft = t_batch / gen_len
-        approx_tpot = (t_batch - approx_ttft) / max(1, gen_len - 1)
-        ttfts.extend([approx_ttft] * n)
-        tpots.extend([approx_tpot] * n)
+        rows = hf_generate_profiled(model, prompts[i:i + batch_size], wl,
+                                    device, ignore_eos)
+        for (ttft, tpot, e2e, n) in rows:
+            ttfts.append(ttft)
+            tpots.append(tpot)
+            e2es.append(e2e)
+            total += n
+    if device == "cuda":
+        torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     del model
-    torch.cuda.empty_cache() if device == "cuda" else None
-    return BenchResult("huggingface", wall, len(prompts), total, ttfts, tpots,
-                       {"batch_size": batch_size,
-                        "note": "TTFT/TPOT are batch-level approximations"})
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    approximate = {"TTFT/TPOT": "custom use_cache loop, real step timings"}
+    if batch_size > 1:
+        approximate["TTFT"] = (f"approximate: first step shared by batch "
+                               f"members (batch={batch_size})")
+    return BenchResult("huggingface", wall, len(prompts), total,
+                       ttfts, tpots, e2es, {"batch_size": batch_size},
+                       approximate)
 
 
-def compare(args):
+# -------------------------------------------------------------------- vLLM
+def run_vllm_once(model_path, prompts, wl: Workload):
+    """Optional baseline: only when vLLM imports and initializes cleanly."""
+    try:
+        from vllm import LLM, SamplingParams
+        llm = LLM(model=model_path, max_model_len=4096,
+                  enable_prefix_caching=True, gpu_memory_utilization=0.75)
+    except Exception as e:                     # not installed / init failure
+        print(f"[vllm] unavailable ({type(e).__name__}: {e}) -- skipped")
+        return None
+    sp = [SamplingParams(temperature=wl.temperature, top_p=wl.top_p,
+                         top_k=wl.top_k if wl.top_k > 0 else None,
+                         max_tokens=wl.output_len, ignore_eos=True)
+          for _ in prompts]
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    outs = llm.generate(prompt_token_ids=prompts, sampling_params=sp)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    total = sum(len(o.outputs[0].token_ids) for o in outs)
+    del llm
+    torch.cuda.empty_cache()
+    return BenchResult("vllm", wall, len(prompts), total, [], [], [],
+                       {"note": "per-request latency metrics not collected "
+                                "(vLLM baseline is throughput-only)"})
+
+
+# ------------------------------------------------------------------ drivers
+def prepare_dtype_str(device):
+    return "float16" if device == "cuda" else "float32"
+
+
+def compare(args, wl: Workload):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device == "cuda" else torch.float32
-    prompts = build_text_workload(args.num_prompts, args.input_len,
-                                  args.shared_prefix_len, args.seed)
-    print(f"workload: {args.num_prompts} prompts x ~{args.input_len} in / "
-          f"{args.output_len} out tokens | shared_prefix={args.shared_prefix_len}")
+    dtype_str = prepare_dtype_str(device)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model)
+    prompts = build_token_workload(tok, wl)
+    max_model_len = max(wl.input_len + wl.output_len + 64, 1024)
+
+    print(f"\n=== workload: {wl.num_prompts} prompts | in~{wl.input_len} "
+          f"out={wl.output_len} | shared_prefix={wl.shared_prefix_ratio:.0%} | "
+          f"concurrency={wl.concurrency} | greedy="
+          f"{wl.temperature == 0.0} ===")
 
     results = []
-    r = run_mini_vllm(args.model, prompts, args.output_len, args.temperature,
-                      args.max_num_seqs, args.block_size,
-                      args.enable_prefix_caching, device, dtype,
-                      max_in_flight=args.max_in_flight)
-    print(r.summary()); results.append(r)
+    # ---- mini-vllm: warmup + measured runs
+    for _ in range(args.warmup):
+        run_mini_vllm_once(args.model, prompts, wl, device, dtype_str,
+                           args.max_num_seqs, args.block_size,
+                           args.enable_prefix_caching, wl.concurrency,
+                           max_model_len)
+    runs = [run_mini_vllm_once(args.model, prompts, wl, device, dtype_str,
+                               args.max_num_seqs, args.block_size,
+                               args.enable_prefix_caching, wl.concurrency,
+                               max_model_len)
+            for _ in range(args.runs)]
+    mini = merge_runs(runs, "mini-vllm")
+    print_result(mini)
+    results.append(mini)
 
-    r = run_hf(args.model, prompts, args.output_len, args.temperature,
-               args.hf_batch_size, device, dtype)
-    print(r.summary()); results.append(r)
+    # ---- HuggingFace
+    for _ in range(max(1, args.warmup // 2)):
+        run_hf_once(args.model, prompts[:min(len(prompts), args.hf_batch_size)],
+                    wl, device, dtype, args.hf_batch_size)
+    hf = run_hf_once(args.model, prompts, wl, device, dtype, args.hf_batch_size)
+    print_result(hf)
+    results.append(hf)
 
-    mini, hf = results
-    speedup = (mini.total_output_tokens / mini.wall_time) / \
-              (hf.total_output_tokens / hf.wall_time)
-    print(f"\n==> mini-vllm throughput speedup over HF generate: {speedup:.2f}x")
+    if device == "cuda" and not args.no_vllm:
+        v = run_vllm_once(args.model, prompts, wl)
+        if v is not None:
+            print_result(v)
+            results.append(v)
+
+    base = results[0]
+    for other in results[1:]:
+        print(f"\n==> mini-vllm throughput vs {other.engine}: "
+              f"{base.throughput / other.throughput:.2f}x")
     return results
 
 
 def bench_speculative(args):
-    """Speculative decoding: same model greedy, with and without drafting."""
+    """Speculative decoding: same model greedy, with and without drafting.
+    Correctness is asserted (spec output == plain greedy output)."""
     from minivllm import EngineConfig, LLMEngine, SamplingParams
     from minivllm.spec.spec_engine import SpeculativeEngine
-    import time as _time
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device == "cuda" else torch.float32
@@ -227,7 +479,10 @@ def bench_speculative(args):
         prompts = [" ".join(base) for _ in range(args.num_prompts)]
         print("workload: repeating-text prompts (n-gram friendly)")
     else:
-        prompts = build_text_workload(args.num_prompts, args.input_len, 0)
+        from transformers import AutoTokenizer
+        tk = AutoTokenizer.from_pretrained(args.model)
+        prompts = [" ".join(map(str, p)) for p in build_token_workload(
+            tk, Workload(args.num_prompts, args.input_len, args.output_len))]
 
     cfg = EngineConfig(model=args.model, device=device,
                        dtype=str(dtype).split(".")[-1],
@@ -235,61 +490,190 @@ def bench_speculative(args):
                        max_model_len=4096, max_num_batched_tokens=4096,
                        enable_prefix_caching=False)
 
-    # baseline: plain engine, single stream
-    engine = LLMEngine(cfg)
     params = SamplingParams(temperature=0.0, max_tokens=args.output_len,
                             ignore_eos=True)
-    t0 = _time.perf_counter()
-    base_out = engine.generate(prompts[:1], params, use_tqdm=False)
-    base_wall = _time.perf_counter() - t0
+
+    def plain_once():
+        engine = LLMEngine(cfg)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = engine.generate(prompts[:1], params, use_tqdm=False)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        del engine
+        return out, wall
+
+    def spec_once():
+        spec = SpeculativeEngine(cfg, drafter=args.spec_drafter,
+                                 num_spec_tokens=args.num_spec_tokens)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outs = spec.generate(prompts[:1], params, use_tqdm=False)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        o = outs[0]
+        del spec
+        return o, wall
+
+    base_out, base_wall = plain_once()           # warmup
+    for _ in range(args.warmup):
+        plain_once()
+    walls = []
+    for _ in range(args.runs):
+        _, w = plain_once()
+        walls.append(w)
+    base_wall = statistics.median(walls)
     base_tokens = len(base_out[0].outputs[0]["token_ids"])
-    print(f"[plain single-stream] {base_tokens} tokens in {base_wall:.2f}s "
-          f"-> {base_tokens / base_wall:.1f} tok/s")
-    del engine
+    print(f"[plain single-stream] {base_tokens} tokens | median "
+          f"{base_wall:.2f}s -> {base_tokens / base_wall:.1f} tok/s "
+          f"(runs={args.runs})")
 
-    # speculative
-    spec = SpeculativeEngine(cfg, drafter=args.spec_drafter,
-                             num_spec_tokens=args.num_spec_tokens)
-    t0 = _time.perf_counter()
-    outs = spec.generate(prompts[:1], params, use_tqdm=False)
-    spec_wall = _time.perf_counter() - t0
-    o = outs[0]
-    print(f"[speculative x{args.spec_drafter} gamma={args.num_spec_tokens}] "
-          f"{len(o.token_ids)} tokens in {spec_wall:.2f}s -> "
-          f"{len(o.token_ids) / spec_wall:.1f} tok/s | "
-          f"acceptance={o.acceptance_rate:.1%} tokens/round={o.tokens_per_round:.2f}")
-    print(f"==> latency speedup: {base_wall / spec_wall:.2f}x")
-    assert o.token_ids == base_out[0].outputs[0]["token_ids"], \
+    spec_out, _ = spec_once()                    # warmup + correctness
+    assert spec_out.token_ids == base_out[0].outputs[0]["token_ids"], \
         "speculative output must equal plain greedy output"
+    for _ in range(args.warmup):
+        spec_once()
+    swalls, acc, tpr = [], [], []
+    for _ in range(args.runs):
+        o, w = spec_once()
+        swalls.append(w)
+        acc.append(o.acceptance_rate)
+        tpr.append(o.tokens_per_round)
+    spec_wall = statistics.median(swalls)
+    print(f"[speculative x{args.spec_drafter} gamma={args.num_spec_tokens}] "
+          f"{len(spec_out.token_ids)} tokens | median {spec_wall:.2f}s -> "
+          f"{len(spec_out.token_ids) / spec_wall:.1f} tok/s | "
+          f"acceptance={statistics.median(acc):.1%} "
+          f"tokens/round={statistics.median(tpr):.2f}")
+    print(f"==> latency speedup (median of {args.runs} runs): "
+          f"{base_wall / spec_wall:.2f}x")
 
 
+def bench_sampling(args):
+    """Sampling microbenchmark: per-sequence sync style vs batched sampler."""
+    from minivllm.sampling import sample_from_logits, sample_tokens
+    from minivllm.sequence import SamplingParams, Sequence
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"sampling microbenchmark on {device}: per-seq .item() syncs vs "
+          f"batched sampler (<=1 sync per group)")
+
+    class S(Sequence):
+        pass
+
+    for B in (1, 4, 16, 32, 64):
+        torch.manual_seed(0)
+        logits = torch.randn(B, 32000, device=device)
+        seqs = []
+        for i in range(B):
+            p = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=1)
+            s = Sequence([1], p)
+            s.rng_seed = 1000 + i
+            seqs.append(s)
+
+        # old style: per-sequence sample_from_logits (1 D2H each)
+        def old_style(B=B, logits=logits, seqs=seqs):
+            for i in range(B):
+                sample_from_logits(logits[i], 0.7, -1, 0.9,
+                                   generator=seqs[i].sampling_generator())
+
+        def new_style(logits=logits, seqs=seqs):
+            sample_tokens(logits, seqs)
+
+        def bench(fn, reps=20):
+            for _ in range(3):
+                fn()
+            if device == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                fn()
+            if device == "cuda":
+                torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / reps * 1000
+
+        t_old = bench(old_style)
+        t_new = bench(new_style)
+        print(f"  B={B:>3}: per-seq {t_old:7.2f} ms | batched {t_new:6.2f} ms "
+              f"| speedup {t_old / t_new:.1f}x")
+
+
+# --------------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser(description="mini-vllm benchmark")
-    ap.add_argument("--mode", choices=["compare", "spec"], default="compare")
+    ap.add_argument("--mode", choices=["compare", "spec", "sampling"],
+                    default="compare")
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--num-prompts", type=int, default=16)
-    ap.add_argument("--input-len", type=int, default=128)
-    ap.add_argument("--output-len", type=int, default=64)
-    ap.add_argument("--shared-prefix-len", type=int, default=0)
+    ap.add_argument("--input-len", type=int, default=128,
+                    help="single value or comma list (matrix sweep)")
+    ap.add_argument("--output-len", type=int, default=64,
+                    help="single value or comma list (matrix sweep)")
+    ap.add_argument("--shared-prefix-ratio", type=float, default=0.0,
+                    help="single value or comma list: 0 / 0.5 / 0.9 ...")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="mini-vllm max in-flight; single or comma list")
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=-1)
     ap.add_argument("--max-num-seqs", type=int, default=16)
     ap.add_argument("--block-size", type=int, default=16)
-    ap.add_argument("--hf-batch-size", type=int, default=4)
-    ap.add_argument("--max-in-flight", type=int, default=8,
-                    help="max unfinished requests kept in the engine "
-                         "(lower = more staggered arrivals)")
+    ap.add_argument("--hf-batch-size", type=int, default=1)
     ap.add_argument("--enable-prefix-caching", action="store_true")
     ap.add_argument("--device", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--no-vllm", action="store_true",
+                    help="do not try the vLLM baseline")
+    ap.add_argument("--output", default=None,
+                    help="write results to this JSON file")
     ap.add_argument("--spec-drafter", default="ngram",
                     help="'ngram' or an HF model path used as the drafter")
-    ap.add_argument("--num-spec-tokens", type=int, default=4)
+    ap.add_argument("--num-spec-tokens", type=int, default=8)
     args = ap.parse_args()
 
-    if args.mode == "compare":
-        compare(args)
-    else:
+    def csv(x):
+        return [float(v) if "." in str(v) else int(v)
+                for v in str(x).split(",")]
+
+    if args.mode == "sampling":
+        bench_sampling(args)
+        return
+
+    if args.mode == "spec":
         bench_speculative(args)
+        return
+
+    json_out = {"model": args.model, "results": []}
+    for input_len in csv(args.input_len):
+        for output_len in csv(args.output_len):
+            for ratio in csv(args.shared_prefix_ratio):
+                for conc in csv(args.concurrency):
+                    wl = Workload(num_prompts=args.num_prompts,
+                                  input_len=int(input_len),
+                                  output_len=int(output_len),
+                                  shared_prefix_ratio=float(ratio),
+                                  seed=args.seed,
+                                  temperature=args.temperature,
+                                  top_p=args.top_p, top_k=args.top_k,
+                                  concurrency=int(conc))
+                    results = compare(args, wl)
+                    device = args.device or ("cuda" if torch.cuda.is_available()
+                                             else "cpu")
+                    dtype_str = prepare_dtype_str(device)
+                    for r in results:
+                        json_out["results"].append(result_to_json(
+                            r, wl, args.model, device, dtype_str))
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(json_out, f, indent=2, ensure_ascii=False)
+        print(f"\nresults written to {args.output}")
 
 
 if __name__ == "__main__":

@@ -9,14 +9,22 @@ difference shows up as different greedy tokens. We test:
   4. prefix caching ON vs OFF must produce identical outputs,
   5. parallel sampling (n=3): all children equal the parent under greedy.
 """
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import torch
+from helpers import (
+    TINY,
+    make_tiny_engine,
+    make_tiny_pair,
+    random_prompts,
+    run_engine_greedy,
+    run_hf_greedy,
+)
 
-from helpers import (make_tiny_pair, make_tiny_engine, random_prompts,
-                     run_engine_greedy, run_hf_greedy, TINY)
 from minivllm.sequence import SamplingParams
 
 
@@ -86,7 +94,6 @@ def test_prefix_cache_produces_identical_outputs():
 def test_fully_cached_prompt_still_correct():
     engine, hf = make_tiny_engine(seed=0, enable_prefix_caching=True)
     prompt = random_prompts(1, min_len=16, max_len=16, seed=14)[0]
-    params = SamplingParams(temperature=0.0, max_tokens=6, ignore_eos=True)
 
     first = run_engine_greedy(engine, [prompt], max_new_tokens=6)[0]
     # run the identical prompt again: prefill is fully cache-hits

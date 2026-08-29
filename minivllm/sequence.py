@@ -2,7 +2,8 @@
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional
+
+import torch
 
 
 class SequenceStatus(Enum):
@@ -26,9 +27,9 @@ class SamplingParams:
     top_k: int = -1                # -1 disables
     max_tokens: int = 64
     n: int = 1                     # parallel sampling: n sequences forked from one prompt
-    stop: List[str] = field(default_factory=list)
+    stop: list[str] = field(default_factory=list)
     ignore_eos: bool = False
-    seed: Optional[int] = None
+    seed: int | None = None
 
     def __post_init__(self):
         assert self.max_tokens > 0
@@ -51,33 +52,48 @@ class Sequence:
 
     _next_id = 0
 
-    def __init__(self, prompt_token_ids: List[int], sampling_params: SamplingParams,
-                 arrival_time: Optional[float] = None):
+    def __init__(self, prompt_token_ids: list[int], sampling_params: SamplingParams,
+                 arrival_time: float | None = None):
         self.seq_id = Sequence._next_id
         Sequence._next_id += 1
 
         self.prompt_token_ids = list(prompt_token_ids)
-        self.output_token_ids: List[int] = []
+        self.output_token_ids: list[int] = []
         self.sampling_params = sampling_params
 
         self.status = SequenceStatus.WAITING
         self.num_computed_tokens = 0
 
         # Managed by BlockSpaceManager
-        self.block_table: List[int] = []
-        self.block_keys: List[Optional[tuple]] = []
+        self.block_table: list[int] = []
+        self.block_keys: list[tuple | None] = []
 
         # Timing (for TTFT / TPOT metrics)
         self.arrival_time = arrival_time if arrival_time is not None else time.perf_counter()
-        self.first_token_time: Optional[float] = None
-        self.last_token_time: Optional[float] = None
+        self.first_token_time: float | None = None
+        self.last_token_time: float | None = None
 
         # Fork bookkeeping (parallel sampling): id of the parent sequence
-        self.parent_seq_id: Optional[int] = None
+        self.parent_seq_id: int | None = None
+
+        # Per-request RNG (see minivllm/sampling.py): the engine derives a
+        # stable 64-bit seed from (engine_seed, request_id, sample_idx,
+        # user_seed) and each sequence lazily owns an independent Generator,
+        # so sampled output never depends on batch composition.
+        self.rng_seed: int | None = None
+        self.sample_idx: int = 0          # 0 = main output, 1..n-1 = forks
+        self._generator: torch.Generator | None = None
+
+    def sampling_generator(self) -> torch.Generator:
+        """This sequence's own CPU generator (independent of other requests)."""
+        if self._generator is None:
+            self._generator = torch.Generator()
+            self._generator.manual_seed(self.rng_seed if self.rng_seed is not None else 0)
+        return self._generator
 
     # ---- token views -------------------------------------------------------
     @property
-    def tokens(self) -> List[int]:
+    def tokens(self) -> list[int]:
         """prompt + generated so far."""
         return self.prompt_token_ids + self.output_token_ids
 
@@ -89,7 +105,7 @@ class Sequence:
     def num_prompt_tokens(self) -> int:
         return len(self.prompt_token_ids)
 
-    def get_new_tokens(self) -> List[int]:
+    def get_new_tokens(self) -> list[int]:
         """Tokens not yet written to the KV pool."""
         return self.tokens[self.num_computed_tokens:]
 
@@ -137,5 +153,5 @@ class RequestOutput:
 
     request_id: int
     prompt: str
-    outputs: List[dict] = field(default_factory=list)  # [{text, token_ids, ttft, tpot}]
+    outputs: list[dict] = field(default_factory=list)  # [{text, token_ids, ttft, tpot}]
     finished: bool = False

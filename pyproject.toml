@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minivllm"
+version = "0.2.0"
+description = "A from-scratch mini vLLM inference engine: block-level KV cache (PagedAttention), continuous batching + chunked prefill, prefix caching, speculative decoding -- pure PyTorch, built for learning inference systems"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "WJX3078" }]
+keywords = ["llm", "inference", "vllm", "kv-cache", "paged-attention",
+            "continuous-batching", "speculative-decoding", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.43",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+include = ["minivllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device (deselect with -m 'not gpu')",
+    "slow: long-running tests",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [".git", "__pycache__", ".pytest_cache", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # bugbear (common bugs)
+    "UP",     # pyupgrade
+    "SIM",    # simplify
+]
+ignore = [
+    "E501",   # long lines in comments/docstrings are fine; code stays short
+    "SIM108", # ternary is not always clearer
+    "B008",   # default args call factories (dataclass defaults are fine)
+    "SIM105", # contextlib.suppress is slower and less obvious
+    "B905",   # zip strict not needed on 3.10 code style here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "SIM117"]
