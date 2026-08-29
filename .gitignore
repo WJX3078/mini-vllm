@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Models / caches
+*.safetensors
+*.bin
+HF_HOME/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
