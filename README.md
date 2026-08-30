@@ -1,338 +1,340 @@
-# mini-vLLM：从零实现的推理引擎（Paged KV Cache · Continuous Batching · Chunked Prefill · Prefix Caching · Speculative Decoding）
+# mini-vLLM v0.3 — From-Scratch LLM Inference Runtime
 
 [![CI](https://github.com/WJX3078/mini-vllm/actions/workflows/ci.yml/badge.svg)](https://github.com/WJX3078/mini-vllm/actions/workflows/ci.yml)
 
-一个为**学习推理系统**而写的迷你 vLLM，基于 Qwen2.5-0.5B，纯 PyTorch 实现（无 CUDA kernel），把推理岗面试高频的机制全部亲手写了一遍：
+一个为**学习推理系统**而写的迷你 vLLM，基于 Qwen2.5-0.5B。v0.2 完成了调度与正确性；**v0.3 深入 GPU runtime**：Triton PagedAttention kernel、GPU 原生采样、KV 容量预留/物理分配解耦、持久化 metadata、逐阶段 runtime profiler——每一层都带正确性测试与真机数据。
 
-| 机制 | 对应 vLLM 概念 | 代码入口 |
+## GPU Runtime 架构（v0.3）
+
+```
+Request
+  │
+  ▼
+Scheduler ──────────────  Unified Token Budget（decode 优先 + prefill chunk）
+  │  ├─ Token Budget       enable_chunked_prefill=False 时 prompt 必须整段放下
+  │  ├─ KV Reservation     准入检查并登记完整 cold-prompt 容量（cache hit 不计）
+  │  └─ Block Allocation   物理块按 scheduled span 惰性物化（reserve ≠ allocate）
+  ▼
+Metadata Builder ────────  pinned staging + 非阻塞 H2D，热路径零新建张量
+  │
+  ▼
+GPU Runtime
+  ├── Qwen Forward         varlen 平铺批（RoPE/SDPA/Flash 风格逐层）
+  ├── PagedAttention       triton backend：kernel 直接按 block table 遍历物理块
+  │   （decode q_len=1）   torch backend：gather + SDPA（fallback，所有设备）
+  └── GPU-native Sampler   CPU 各自 RNG 出 u → H2D [B] → GPU top-k/top-p +
+                           inverse CDF → D2H [B] token ids
+  │
+  ▼
+Token IDs
+```
+
+**三个概念，不要混淆：**
+
+| 概念 | 是什么 | 本项目位置 |
 |---|---|---|
-| Block 级 KV Cache（逻辑块→物理块映射、引用计数、COW、LRU 驱逐） | PagedAttention 的内存层 | `minivllm/block_manager.py` |
-| Continuous batching + **Chunked prefill**（统一 token 预算的 iteration 级调度 + 抢占重算） | `Scheduler` (V1-style) | `minivllm/scheduler.py` |
-| Prefix caching（块粒度哈希链复用，**可插拔 hash backend**） | `enable_prefix_caching` | `block_manager.py` + `prefix_hash.py` |
-| Speculative decoding（n-gram / 小模型 draft + 一步验证，**分布无损**） | SpecDecode worker | `minivllm/spec/` |
-| **Per-request RNG**（请求级随机流，批组成无关） | V1 sampler 语义 | `sampling.py` + `sequence.py` |
-| **Batched sampling**（按采样配置分组，每组 ≤1 次 GPU→CPU 同步） | V1 batched sampler | `minivllm/sampling.py` |
-| **增量 stop 检查**（token 序列 fast path + 窗口 decode fallback） | `stop_checker` | `minivllm/stopping.py` |
+| **Paged KV Cache** | 内存管理：KV 切块、block table、引用计数/COW/LRU | `block_manager.py` + `kv_pool.py` |
+| **Paged Attention** | kernel 层：attention 直接按页访问分块 KV，不物化连续 K/V | `kernels/paged_attention.py` |
+| **Continuous Batching** | 调度策略：iteration 级重组批、chunked prefill、抢占 | `scheduler.py` |
 
-正确性保证（**92 个测试，CI 覆盖 Python 3.10/3.11/3.12**）：
+v0.2 只有第一层 + gather/SDPA；**v0.3 的 Triton kernel 让"paged attention"名副其实**。
 
-* fp32 下与 HuggingFace `generate` **逐 token 完全一致**（随机小模型端到端对齐）；
-* 前缀缓存开/关、chunked prefill 开/关、抢占恢复、并行采样 COW 输出全部一致；
-* 投机解码用**统计检验**证明采样分布严格等于目标分布（含 n-gram + temperature>0，2~5 万次试验）；
-* EOS/stop 出现在 **proposal 中途**时逐 token 截断，KV/输出/缓存三方一致；
-* property-style 随机配置扫描：`computed ≤ tokens`、块表覆盖、引用计数、free-list 一致性等不变量。
+| 机制 | 代码入口 |
+|---|---|
+| Block 级 KV Cache（映射/引用计数/COW/LRU/抢占重算） | `minivllm/block_manager.py` |
+| **KV Reservation ≠ Allocation**（准入登记容量，span 惰性物化） | `block_manager.py` + `scheduler.py` |
+| Continuous batching + Chunked prefill（统一 token 预算） | `minivllm/scheduler.py` |
+| Prefix caching（哈希链，metadata 入根，tuple/sha256 可插拔） | `block_manager.py` + `prefix_hash.py` |
+| **Triton PagedAttention decode kernel**（online softmax，GQA） | `minivllm/kernels/` |
+| **GPU-native sampling**（inverse CDF，D2H 从 O(B·V) 到 O(B)） | `minivllm/sampling.py` |
+| Speculative decoding（无损拒绝采样 + committed-stream stop 检查） | `minivllm/spec/` |
+| Per-request RNG（批组成无关）/ 增量 stop 检查 | `sampling.py` / `stopping.py` |
+| **Runtime step profiler**（schedule/metadata/forward/sampling 分解） | `bench/profile_runtime.py` |
 
----
+正确性保证（**889 个测试**；CPU CI 覆盖 Python 3.10/3.11/3.12，GPU/Triton 测试用 `gpu`/`triton` marker 与 CI 隔离）：
+
+* fp32 与 HuggingFace `generate` **逐 token 全等**（随机小模型端到端）；
+* **Correctness Matrix**：attention backend (torch/triton) × greedy/sampling × 前缀缓存 × chunked prefill × MHA/GQA × 单请求/连续批（`tests/test_correctness_matrix.py`）；
+* **Triton kernel 数值矩阵**：3 batch × 7 context（含 1/15/16/17/511 等边界）× 3 block size × 3 head 布局 × 2 head_dim × fp16/bf16 = **758 个组合全部对齐** PyTorch reference（`tests/test_paged_attention.py`）；
+* GPU 采样分布统计检验（50k draws）+ GPU/CPU 同 seed 逐 token 一致；
+* 投机解码分布无损（数万次试验）+ **stop 串只看 committed 流**（v0.3 修复）；
+* property 不变量扫描 + KV reservation 记账一致性。
 
 ## 快速开始
 
 ```bash
 pip install -e .                       # 或 pip install -r requirements.txt
-pytest tests/ -q                       # 92 个测试，无需下载模型（随机小权重）
-ruff check .                           # lint（CI 同款）
+pytest tests/ -q                       # CPU 测试，无需下载模型
+ruff check .
 
-# 需要真实模型（~1GB，首次自动下载；国内可 export HF_ENDPOINT=https://hf-mirror.com）
-python examples/basic_generate.py                   # 基础生成 + 引擎统计
-python examples/prefix_cache_demo.py                # 前缀缓存：warm 批 TTFT 1105ms→168ms
-python examples/spec_demo.py                        # n-gram 投机解码 4.2x（复述类任务）
+# GPU 测试（本机有 RTX 4060 时）
+pytest tests/ -m gpu                   # 含 Triton kernel 正确性矩阵
 
-# Benchmark（吞吐 / TTFT / TPOT / E2E，中位数 + p50/p95/p99，JSON 输出）
+# 真实模型（~1GB，首次自动下载；国内可 export HF_ENDPOINT=https://hf-mirror.com）
+python examples/basic_generate.py
+python examples/prefix_cache_demo.py                # warm TTFT 1105ms→168ms
+python examples/spec_demo.py                        # n-gram 投机解码 4.2x
+
+# Benchmarks
 python -m minivllm.bench.bench --mode compare --num-prompts 16 \
     --input-len 128 --output-len 64 --concurrency 16
-python -m minivllm.bench.bench --mode spec --spec-drafter ngram --num-spec-tokens 8
-python -m minivllm.bench.bench --mode sampling      # 采样同步开销 microbenchmark
-python -m minivllm.bench.prefix_hash_bench          # hash backend microbenchmark
+python -m minivllm.bench.bench --mode compare --input-len 2048 --output-len 64 \
+    --max-num-batched-tokens 256        # 明确触发 chunked prefill
+python -m minivllm.bench.bench --mode scheduler    # 4 个调度场景 × chunked ON/OFF
+python -m minivllm.bench.bench --mode spec --num-spec-tokens 8
+python -m minivllm.bench.bench --mode sampling     # 采样 D2H 对比
+python -m minivllm.bench.paged_attention_bench     # kernel 微基准
+python -m minivllm.bench.profile_runtime           # 逐阶段 step 分解
 ```
-
-架构上模型是配置驱动的，任何 Qwen2/Qwen2.5 尺寸都能跑（draft model 传另一个 HF 模型路径即可）。
 
 ---
 
-## 1. Block 级 KV Cache（PagedAttention 的核心）
+## 1. Block 级 KV Cache + KV Reservation（内存层）
 
-### 问题：传统 KV cache 为什么浪费
+### Paged KV 的动机
 
-传统连续 KV cache 要求**每个序列的 K/V 在逻辑上连续存储**：DynamicCache 随生成逐步 `cat` 增长，带来反复的内存重组与分配开销；StaticCache 则要提前按最大长度预留。两者都难以支持多序列动态并发、跨请求共享前缀和抢占——Paged KV 把 K/V 切成固定大小 block，用 block table 把逻辑块映射到任意物理块，从根本上解决这三件事（这也是 vLLM 论文的核心动机）。
+传统连续 KV cache 要求每序列 K/V 逻辑连续：DynamicCache 逐步 `cat` 有重组开销，StaticCache 按最大长度预留。Paged KV 切成固定 block，block table 映射任意物理块——多序列并发、前缀共享、抢占从此都是块级操作。
 
-### 方案：像操作系统管内存一样管 KV
+机制（`BlockSpaceManager`）：按需分配（内部碎片 ≤1 块）、引用计数、半满块 COW、ref=0 缓存块 LRU 驱逐、recompute 抢占（配合前缀缓存重调度只重算生成部分）。
+
+### v0.3：Reservation ≠ Allocation
+
+v0.2 的 chunked prefill "计算上分片，但准入一次分配整段 prompt 的块"——一个 8K prompt 只算了 256 token 就占着 8K 的显存，提前挤压其他请求并诱发缓存驱逐。v0.3 把两件事拆开：
 
 ```
-逻辑视图（每序列一个 block table）          物理池（一次性预分配的大张量）
-seq A: [4] [7] [9]  ← 逻辑块0/1/2          pool.data[block_id, layer, K|V, kv_head, slot, dim]
-seq B: [5] [8]                             任意物理块可被任意序列通过 block table 引用，
-seq C: [4] [6]      ← A、C 共享块4（前缀复用） ref_count > 1 即共享
+Admission
+    ↓ 只读 cache probe（get_cached_prefix，不动 ref_count）
+    ↓ 预算检查（只按未缓存 token 扣 max_num_batched_tokens）
+    ↓ 容量检查 + 登记：cold_blocks = ceil((prompt - cache_hit) / block_size)
+      （cache-hit 块不占新容量；其他序列的未兑现 reservation 计入占用）
+Reservation（记账，不是显存）
+    ↓
+物理块按 scheduled span 惰性物化（allocate_span 逐块扣减 reservation）
 ```
 
-关键机制（都在 `BlockSpaceManager`）：
+* `scheduler_reserve_full_isl=True`（默认）：准入检查**整段**冷容量——不过度准入、无 KV 抖动；`=False`：只检查首 chunk，激进准入，代价是可能抢占（有 A/B 开关）；
+* **抢占释放 reservation**，重新准入重新登记，记账永远一致（`total_reserved_blocks` 全局校验）；
+* 数据（8×8K prompt、22K token 池、budget 256）：full-ISL reservation 把并发准入压到 2 个 prompt（峰值 1002/1400 块，**零抢占**——多出的 6 个在 waiting 排队而不是挤爆池子）；lazy 与 eager 的稳态峰值收敛（准入的 prompt 终会物化完全），lazy 的收益在瞬态占用（首 iteration 只持有首个 chunk 的块，约 3%）与策略解耦本身。
 
-* **按需分配**：序列每写满一个块才拿下一个块，内部碎片 ≤ 1 块（block_size=16 时最多浪费 15 个 token 槽）。
-* **引用计数**：块被多个序列映射时 `ref_count > 1`。
-* **Copy-on-Write**：共享的**半满块**被写入前先复制（并行采样的 fork 场景）；**满块永不原地写**，可无限共享。
-* **LRU 驱逐**：`ref_count==0` 的缓存块按 LRU 淘汰，回收物理块。
-* **抢占重算（recompute preemption）**：显存耗尽时从 running 队尾踢序列、释放块；重新调度时前缀缓存直接命中旧块，只重算少量 token。
-
-### KV cache 大小计算（必考）
+### KV 大小计算（面试必考）
 
 ```
 每 token KV = 2 (K+V) × n_layers × n_kv_heads × head_dim × dtype_bytes
+Qwen2.5-0.5B fp16: 2 × 24 × 2 × 64 × 2B = 12 KB/token（GQA 压缩 7 倍）
 ```
 
-Qwen2.5-0.5B（24 层，GQA 14 个 Q 头 / **2 个 KV 头**，head_dim=64，fp16）：
-
-```
-2 × 24 × 2 × 64 × 2B = 12 KB/token，一个 16-token 块 = 192 KB
-```
-
-`config.py` 里的 `ModelConfig.kv_bytes_per_token()` 就是这个公式；引擎启动时打印实际数值。对比：若没有 GQA（14 个 KV 头），同样的模型每 token 要 84 KB —— **GQA 把 KV cache 压缩了 7 倍**，这就是 MHA→GQA→MQA 演进的动机（MQA = 1 个 KV 头，压到极限）。
-
-### 本项目的 attention 与真实 vLLM 的关系
-
-本项目的 decode 路径把整个 batch 的 K/V 写入、按 block table 聚合（gather）、SDPA 注意力各合并成**一次批量操作**；prefill 路径对每个序列 gather + SDPA。真实 vLLM 用单个融合 CUDA kernel（paged attention kernel）直接在分块内存上算 flash attention，省掉 gather 的物化。**内存布局和语义完全一致，差别只在 kernel 融合**。
-
----
-
-## 2. Scheduler：统一 token 预算（Continuous Batching + Chunked Prefill）
-
-### static batching 的问题
-
-HF `generate` 把一批请求绑定到批生命周期：短的先完成也只能干等长的（下图 `x` 为空转）。请求长度方差越大浪费越多。
-
-```
-static:      |req1 ██████████|
-             |req2 ████████████████|   ← req1 完成后槽位空转
-             |req3 ████|
-
-continuous:  |req1 ██████████|req4 ██████|
-             |req2 ████████████████|
-             |req3 ████|req5 ██████████|    ← 每个 iteration 都重新组批
-```
-
-### 统一 token 预算怎么分配（`scheduler.py`）
-
-每个 engine step 有一个总预算 `max_num_batched_tokens`，**decode token 和 prefill chunk 共享**，按优先级填充：
+## 2. Scheduler：统一 Token 预算
 
 ```
 budget = max_num_batched_tokens
-────────────────────────────────────────────────────────────────
-① decode 优先   running 序列各取 1 token（FCFS）
-                KV 池给不出槽位 → 抢占队尾（recompute 策略）
-② prefill chunk running 中未完成的 prefill 继续推进（FCFS）
-③ 新请求准入    waiting 队头按剩余预算 chunk 化准入
-                chunk = min(剩余 prompt, 剩余预算)
-────────────────────────────────────────────────────────────────
-例：budget=2048，running 里 A/B/C 在 decode（各 1 token），
-    剩余 2045 给新请求 D（prompt 8192）→ 本轮只算 D 的 2045，
-    下一轮继续 —— 长 prompt 永远不会把 decode 卡住超过一个 iteration。
+────────────────────────────────────────────────────
+① decode 优先   running 各取 1 token；池满 → 抢占队尾（recompute）
+② prefill chunk running 未完成 prefill 续算
+③ 新请求准入    chunk = min(未缓存余量, 剩余预算)；cache hit 不扣预算
+────────────────────────────────────────────────────
+enable_chunked_prefill=False：③ 要求整段未缓存余量 ≤ 剩余预算，
+否则保持 WAITING——真正的"legacy 语义"（v0.3 修复：之前开关只影响
+预算钳制，调度器仍会切 chunk）。
 ```
 
-**Prefix cache 感知准入**（重要的正确性/效率修复）：准入前先做一次**只读**缓存探测（不动 ref_count / LRU），预算只按**真正要算的 token 数**扣除——1000 token 的 prompt 命中 900，只扣 100 预算，省出的预算能多收请求。预算检查通过后才正式 `allocate`（分配失败在 block manager 内部回滚，无泄漏）；完全命中的 prompt 强制重算最后一个 token 以产出 logits。
+## 3. Prefix Caching
 
-**chunked prefill 与块分配的关系**：准入时仍一次性预留整个 prompt 的块（**预留 ≠ 计算**，`num_computed_tokens` 跟踪实际计算进度）。这保证"准进来的必装得下"，不会死锁，且完整复用抢占机制；真实 vLLM V1 更激进（按 chunk 惰性分配 + 可抢占 prefill），见"与真实 vLLM 的差距"。
-
-**调度语义不变量**（有测试盯着）：已 running 的 decode 每轮必推进；waiting FCFS 不饿死；`spans` 是本轮每序列真正计算的 `[start, end)`。
-
----
-
-## 3. Prefix Caching（相同前缀复用 KV 块）
-
-**动机**：多轮对话的 system prompt、few-shot 前缀、RAG 文档在请求间完全相同，重复 prefill 纯属浪费。
-
-**块粒度哈希链**（`block_manager.py` + 可插拔 `prefix_hash.py`）：每个**满块**的 key 由内容和前缀链决定：
+块粒度哈希链，**metadata（模型身份）入根**（v0.3 修复：TupleBackend 之前忽略 metadata，README 声称与实现不符）：
 
 ```
-TupleBackend:  key_i = (key_{i-1}, tuple(tokens[i*bs:(i+1)*bs]))   结构相等，无碰撞
-SHA256Backend: key_i = SHA256(key_{i-1} || tokens || metadata)     定长 32B，O(1) 比较
+TupleBackend:  key_i = (key_{i-1}, block_i)，根 = ("metadata", model)
+SHA256Backend: key_i = SHA256(key_{i-1} || tokens || metadata)
 ```
 
-`metadata` 把模型身份编进哈希根；生产系统还会把 **LoRA adapter id、多模态预处理签名、租户 salt** 纳入——两段 KV 只有在"影响 KV 计算的一切"都相同时才允许共享，否则命中即出错。
+32K context 实测（bs=16）：tuple lookup 159ms/O(链长) vs sha256 0.15ms/O(1)，内存 567KB vs 130KB。生产系统还会把 LoRA adapter id、多模态签名、租户 salt 纳入 metadata——"影响 KV 计算的一切"都必须相同才允许共享。
 
-两种 backend 的实测权衡（`python -m minivllm.bench.prefix_hash_bench`，32K context，bs=16）：
+安全细节：只有满块进缓存；先算后注册（chunked prefill 逐 chunk 注册）；探测严格只读；准入失败自动回滚。
 
-```
-            build ms   lookup ms   key 内存 KiB
-tuple          1.53     159.25        567        ← 查找 O(链长)，长上下文退化
-sha256         4.43       0.15        130        ← 查找 O(1)，构建略贵
-```
+## 4. GPU-native Sampling（D2H 从 O(B·V) 到 O(B)）
 
-安全细节（面试可讲的点）：
-
-* **只有满块进缓存**，半满尾块永远私有 —— 内容不完整不能共享；
-* **先算后注册**：块的前向算完才插入缓存表，杜绝"复用到尚未算好的块"（chunked prefill 逐 chunk 注册，被抢占的长 prompt 重调度时自动恢复）；
-* 复用块永不原地写；缓存探测**严格只读**，准入失败自动回滚；
-* 命中的块即使原序列已结束也保留（ref=0，LRU 可驱逐）。
-
-实测（RTX 4060 Laptop，32 请求 × 256 token 输入、224 token 共享前缀，错峰到达）：**缓存命中率 65.6%，warm 批 TTFT mean 1105ms → 168ms**。
-
----
-
-## 4. Speculative Decoding（投机解码，分布无损）
-
-### 算法（`spec/spec_engine.py`）
-
-一轮 = 3 步：
+三代采样路径的系统故事：
 
 ```
-1. DRAFT   便宜 drafter（n-gram 查表 / 小模型自回归）给出 γ 个候选
-2. VERIFY  目标模型一次 forward 吃下 [上轮 bonus] + γ 个候选，
-           在每个位置都拿到分布 p_i —— 一次 forward 验证 γ+1 个位置
-3. ACCEPT  贪心：目标 argmax 与候选一致就收；
-           采样：以 min(1, p(x)/q(x)) 接受，拒绝时从 norm(max(p-q,0)) 重采样
-           —— 数学上保证输出分布与目标模型完全相同，无损
+v0.1 per-seq   : 每序列 argmax().item()/multinomial → B 次 GPU sync/步
+v0.2 cpu-probs : 一次 D2H 搬整张 [B,V] 概率矩阵 → 1 次同步但 O(B·V) 字节
+                 （B=64, V=150k, fp32 ≈ 37.5 MB/步！）
+v0.3 gpu-native: 每序列私有 CPU Generator 出一个均匀数 u_i
+                 → H2D [B] float32
+                 → GPU: filter(top-k/top-p) → softmax → cumsum → inverse CDF
+                 → D2H [B] int64 token ids
 ```
 
-**确定性 drafter 的处理**（常见的错法是直接崩）：n-gram 的 proposal 是点分布 q(x)=1，此时接受概率 = min(1, p(x))，拒绝后从 **p 去掉 x 的质量**后重采样——这是标准 speculative sampling 在 q 退化为 one-hot 时的特例，统计检验（数万次试验）证明每个 commit token 的分布仍严格等于 p。若 p(x)=0（如被 top-k 过滤掉）则 100% 拒绝，residual 退化为 p；若 p==q（residual 全零）正确回退为从 p 采样。
+关键点：**u 仍然来自每序列自己的 RNG 流**——采样结果是 (logits 行, u) 的纯函数，批组成无关性分毫不动（有专项测试）。inverse CDF 的数值边界（u→1 时 cdf 差几个 ulp）用 `clamp_max(vocab-1)` 兜住。
 
-**中途截断**：一轮 commit 的是"k 个被接受候选 + 1 个 bonus"，若 **EOS / stop string 落在这串 token 中间**，从最早的终止点截断——输出 token、KV frontier、前缀缓存注册、drafter 的流视图四方一致，终止后的 proposal/bonus 绝不泄漏进输出（专项测试覆盖）。
+实测（RTX 4060，best of 20，temperature/top-p 路径）：
 
-两种 drafter（`spec/drafters.py`）：
+| B × V | v0.2 cpu-probs | v0.3 gpu-native | 跨设备字节/步 |
+|---|---|---|---|
+| 16 × 150k | 35.6 ms | 3.0 ms（11.9x） | 9375 KB → 0.2 KB |
+| 64 × 150k | 160.4 ms | 19.5 ms（**8.2x**） | 37500 KB → 0.8 KB |
+| 128 × 150k | 344.0 ms | 35.6 ms（9.7x） | 75000 KB → 1.5 KB |
 
-* **NGramDrafter**（prompt-lookup decoding）：在后文找当前后缀上一次出现的位置，把当时后续的 token 抄过来。零模型成本，复述/翻译/代码类任务命中率很高；
-* **ModelDrafter**：一个小语言模型（比如 0.5B 给 1.5B 打草稿），走同一套 paged-KV worker，每轮同步/回滚 draft KV。
+（B=1 时分组开销略负 ~-15%，诚实记录。）
 
-KV 记账（最容易写错的部分，本项目已测）：目标侧 KV 前沿 = 已验收前缀（bonus 挂起）；被拒候选留下的脏槽位只存在于**独占块**，下一轮直接覆写；**缓存表只注册到"最后被验收的 token"为止**，脏数据永不出借。
+## 5. Triton PagedAttention Decode Kernel
 
-实测（RTX 4060，单流 greedy，n-gram γ=8，5 轮取中位）：acceptance 52%、2.56 tokens/round → **2.04x 延迟加速**，输出与普通 greedy 逐 token 一致（断言验证）；demo 场景（复述任务）acceptance 100%、4.2x。
-
----
-
-## 5. Per-request RNG 与 Batched Sampling（性能工程）
-
-### 为什么共享 Generator 是错的
-
-所有序列共用一个 `torch.Generator` 时，**每次采样都会推进共享流**：A 的输出取决于"谁和它同批、什么顺序采样"。正确做法（vLLM V1 语义）：每个序列一个独立 generator，seed 来自**稳定的整数混合**（splitmix64，Python `hash()` 每进程加盐，绝不能用）：
+范围严格限定 decode（q_len=1）；fp16/bf16 存储、fp32 累积；MHA + GQA（`kv_head = q_head // group_size`，constexpr 断言整除）。
 
 ```
-用户指定 seed：rng_seed = mix(seed, sample_idx)          → 同一 seed 重复运行/换批结果不变
-未指定 seed：  rng_seed = mix(engine_seed, request_id, sample_idx) → 请求间互不干扰
-n>1 并行采样： sample_idx 不同 → 子序列独立随机流
+torch backend（fallback）:  paged KV → gather 连续 K/V（物化！）→ SDPA
+triton backend            :  Q → block_table → kernel 直接遍历物理块
+                             → block-wise online softmax → 加权 V 和 → out
 ```
 
-greedy 完全不触碰 RNG，不受影响（都有测试）。
+kernel 要点（`kernels/paged_attention.py`）：
 
-### 为什么 per-seq `.item()` 很慢，batched sampling 快在哪
+* **不物化连续 K/V**：grid=(batch, head)，程序内按 block table 逐物理块加载 K/V；
+* **online softmax**：跨块维护 running max `m`、exp-sum `l`、加权 `acc`——`m_new=max(m,block_max); α=exp(m−m_new); p=exp(s−m_new); l=α·l+Σp; acc=α·acc+Σp·V`，从不保存完整 attention score；
+* 长上下文收益的本质：torch 路径的 gather 要物化 `[B, nb, kvh, bs, D]` 中间张量（B=64/ctx=8192 fp16 ≈ 256 MiB/层/步），Triton 直接页寻址，显存流量即理论 KV 读取量。
 
-每个 decode step 里，每个序列各自 `.argmax().item()` / `.cpu()` 会强制一次 **GPU→CPU 同步**：CPU 停在那等 GPU 把这一步算完，流水线被打断 N 次。`sample_tokens()` 按 `(temperature, top_k, top_p)` 分组：组内一次批量 filter+softmax、**每组最多一次 D2H**，multinomial 在 CPU 用各自的 generator——**RNG 语义和批独立性分毫不动**，同步次数从 N 次降到组数（通常 1）次。实测（RTX 4060，`--mode sampling`）：
+**数值正确性矩阵（758 组合全对齐 PyTorch reference）**：batch {1,4,16} × context {1,15,16,17,128,511,1024} × block {8,16,32} × MHA/GQA{8Q/2KV, 16Q/4KV} × head_dim {64,128} × {fp16,bf16}，fp16 atol/rtol≈1e-2。
+
+**kernel 微基准**（14Q/2KV/head_dim=64/fp16，kernel-only，best of 50）：
+
+| ctx \ B | 1 | 8 | 32 | 64 |
+|---|---|---|---|---|
+| 512 | 4.2x | 7.0x | 9.1x | 10.1x |
+| 2048 | 8.3x | 10.3x | 9.2x | 9.1x |
+| 8192 | 3.0x | 8.3x | 8.8x | **75.6x**（torch 路径 778ms 崩于物化，Triton 10.3ms） |
+
+**端到端**（batch=8/in=128/out=64，真实模型）：triton backend 94.8 tok/s vs torch backend 81.7 tok/s（**+16%**），greedy 输出逐 token 一致（`test_correctness_matrix` GPU 行）。
+
+`attention_backend: "auto" | "torch" | "triton"`——auto 在 CUDA+Triton 可用时选 triton，否则自动回退 torch；CPU 测试永不依赖 Triton。
+
+## 6. Speculative Decoding（无损 + committed-stream stop）
+
+draft-then-verify：接受概率 min(1, p/q)，拒绝从 norm(max(p−q,0)) 重采样；确定性 drafter（n-gram）是 q=onehot 特例（接受率=p(x)），统计检验证明输出分布严格等于 p。
+
+**v0.3 修复 stop 串的真实调用语义**：stop 检查的候选流必须是 `history + accepted + bonus`（committed），而不是 `history + 全部 proposals`——
+
+* rejected proposal 里出现完整 stop 串 → **不能停**（修复前会假停）；
+* bonus token 补全 stop 串 → **必须停**（修复前漏停）；
+* EOS/stop/max_tokens 同轮竞争 → 取 token 位置最早者；
+* 极端情况 bonus 首个 commit 即触发 stop → 零 token 输出合法（`get_ttft` 返回 0）。
+
+四种场景都有 regression 测试（脚本化 drafter 注入可控 proposals）。
+
+实测（RTX 4060，单流 greedy，n-gram γ=8，5 轮中位）：acceptance 52%、2.56 tokens/round → **2.04x**（复述 demo 场景 4.2x）。
+
+## 7. Runtime Overhead：Profiler 与持久化 metadata
+
+`python -m minivllm.bench.profile_runtime`（batch=8/in=128/out=64，triton backend）：
 
 ```
-B=16: per-seq 24.6 ms → batched 9.6 ms（2.6x）
-B=64: per-seq 106 ms  → batched 35.8 ms（3.0x）
+steps=64  wall=5.40s  94.8 tok/s  84.4 ms/step
+schedule     1.04 ms/step   1%
+metadata     0.61 ms/step   1%     ← pinned staging + 非阻塞 H2D
+forward      82.15 ms/step 97%     ← GPU-bound（小模型 decode 的真实分布）
+sampling     0.39 ms/step   0%     ← v0.3 GPU-native 采样
+bookkeeping  0.14 ms/step   0%
 ```
 
-（B=1 时分组开销略负，约 -20%，可忽略。）
+结论被数据固定：**0.5B 模型 batch=8 时引擎是 GPU-bound 的**，CPU 侧总开销 <3ms/步；进一步优化空间在 kernel/带宽（v0.2 时代"每步 15ms Python 开销"的故事已由 chunked prefill + GPU 采样 + Triton kernel 分解并解决）。metadata 持久化把每步新建张量/H2D 次数从 3+2S 次降到每 tensor 类别一次（复用 pinned staging + 非阻塞拷贝）。
 
-### stop string 的增量检查
+**CUDA Graph**（架构就绪、默认关闭、未实测）：`enable_cuda_graph` 预留；只适合 all-decode batch（固定 shape 的 metadata buffer 已就位），prefill/varlen/spec 不适合；本机收益预期有限（CPU 侧仅 ~2ms/步），留作 v0.4 实验——不编造数据。
 
-每生成一个 token 就 `decode(全部历史)` 是 O(T²) 的 tokenizer 开销。`stopping.py` 的做法：stop 串预编码成 token 序列做**后缀匹配 fast path**；匹配不上时只 decode **尾部窗口**（窗口 ≥ 2×最长 stop 序列，保证跨 token 边界的 stop 一定落在窗口内），命中后按 stop 首字符位置回映射到 token 数截断。长输出的 stop 检查从"整段重解码"变成 O(窗口)。
+## 8. Benchmark 实测（RTX 4060 Laptop 8GB · fp16 · Qwen2.5-0.5B）
 
----
-
-## 6. Benchmark 实测（RTX 4060 Laptop 8GB · fp16 · Qwen2.5-0.5B-Instruct）
-
-方法学（`bench.py` 头部同款声明）：计时前后 `torch.cuda.synchronize()`；每组配置 **3 次 warmup + 5 次测量**，吞吐取**中位数**，TTFT/TPOT/E2E 报 p50/p95/p99（所有测量轮的请求合并统计）；**两侧使用完全相同的 token-id prompt、tokenizer、dtype、采样参数与输出长度**（greedy + ignore_eos，输出长度由 workload 控制，保证墙钟时间纯比引擎）；HF 的 TTFT/TPOT 用**自定义 use_cache 循环逐步计时**（真实首 token 延迟，不再用 batch_latency/tokens 冒充；batch>1 时标注 approximate）。vLLM 装了就自动加为第三条基线，没装优雅跳过。
+方法学（`bench.py` 头部声明）：计时区间两端 `torch.cuda.synchronize()`；**所有引擎统一 warmup N + measured N**（v0.3 修复：HF/vLLM 之前只跑 1 次），吞吐取中位数，TTFT/TPOT/E2E p50/p95/p99 合并统计；相同 token-id prompt/tokenizer/dtype/采样参数/输出长度（greedy + ignore_eos，输出长度 workload 控制）；**HF 吞吐与延迟拆分**（v0.3）——throughput runner 用原生 `model.generate`（仅计时区间同步，不逐 token sync），latency profiler 用自定义 use_cache 循环逐步计时并标注 profiling（绝不拿它的吞吐做对比）；vLLM 基线参数对齐（dtype/max_model_len/prefix caching/sampling/seed），未安装则跳过。
 
 | workload（greedy, ignore_eos） | mini-vllm | HuggingFace | 加速 |
 |---|---|---|---|
-| 16×(128in/64out)，HF batch=1 | **78.3 tok/s**（中位） | 12.8 tok/s | **6.1x** |
-| 32×(256in/32out)，共享前缀 87.5%，缓存开 | **125.7 tok/s**（命中 65.6%） | 51.5 tok/s（batch=4） | **2.4x** |
-| 8×(2048in/32out)，concurrency=8 | **43.4 tok/s**，TTFT p50 **1.96s** | 40.7 tok/s，TTFT **4.04s**（batch=8） | 1.07x / **TTFT 2.1x** |
+| 16×(128in/64out)，HF batch=1 | 78.3 tok/s（中位） | 12.8 tok/s | 6.1x |
+| 32×(256in/32out) 共享前缀 87.5% | 125.7 tok/s（命中 65.6%） | 51.5 tok/s（batch=4） | 2.4x |
+| 8×(2048in/32out) | TTFT p50 **1.96s** | TTFT 4.04s（batch=8） | TTFT 2.1x |
+| engine e2e（batch=8 triton vs torch backend） | 94.8 vs 81.7 tok/s | — | +16% |
 
-长输入场景正是 chunked prefill 的价值：HF 的静态批必须先把 16K token 一次性 prefill 完（TTFT 4 秒），mini-vllm 把 prefill 切片混进 decode 流，首批请求 ~1.2s 就开始出 token；代价是 decode 步与 chunk 同迭代时 TPOT 略升（72→115ms），这就是 chunked prefill 的经典 trade-off，数据里看得见。
+调度器专项（`--mode scheduler`，chunked ON vs OFF × 4 场景，真机数据）：
 
-投机解码（单流 greedy，n-gram γ=8，5 轮中位）：acceptance 52%、2.56 tokens/round → **2.04x 延迟加速**（复述类 demo 场景 4.2x）。
+| 场景 | chunked | whole-prompt | 说明 |
+|---|---|---|---|
+| A decode-heavy（32×128/128） | 187.6 tok/s | **232.8 tok/s** | 无压力时 chunking 的 Python 开销可见（诚实数据） |
+| B long-prefill（8×4096/64） | **11.5 tok/s** | 10.4 tok/s | 混批收益 + TTFT 改善 |
+| C prefix-hit 90%（32×256/32） | 178.2（命中 92.5%） | 184.4（87.5%） | 命中后 prefill 已很短，差距收窄 |
+| D KV 压力（512 块小池） | 1 次抢占 | 2 次抢占 | 两种模式都触发 recompute 路径 |
 
-诚实的短板：**batch=1 单流吞吐低于 HF**（本项目每步 ~15ms 的 Python/调度开销 vs HF 的 C++ 循环），0.5B 小模型 decode 步骤极短时开销占比最大；真实 vLLM 用 CUDA graph + 融合 kernel 把这部分压到近乎零。**结论：continuous batching 的收益来自批量摊薄开销，batch 越大相对 HF 优势越大**。另外本机为笔记本 GPU，绝对数值会随功耗状态波动——请以复现命令自测为准。
+结论：chunked prefill 不是免费午餐——混入长 prefill 时它救 TTFT，但无压力时每 chunk 的调度开销会吃掉 ~20% 吞吐；这就是 `enable_chunked_prefill` 做成开关、benchmark 给出对比的意义。JSON 输出（`--output`）含全部 workload/metrics 字段便于绘图。
 
-复现：
+诚实短板：batch=1 单流吞吐低于 HF（Python 循环 vs C++ generate 循环）；Triton kernel 在 ctx=128/B=1 的小 kernel 场景收益有限（launch 开销主导）；本机为笔记本 GPU，绝对数值随功耗波动，以自测为准。
 
-```bash
-python -m minivllm.bench.bench --mode compare --num-prompts 16 --input-len 128 \
-    --output-len 64 --concurrency 16 --hf-batch-size 1
-python -m minivllm.bench.bench --mode compare --num-prompts 32 --input-len 256 \
-    --output-len 32 --shared-prefix-ratio 0.875 --enable-prefix-caching \
-    --concurrency 16 --hf-batch-size 4
-python -m minivllm.bench.bench --mode compare --num-prompts 8 --input-len 2048 \
-    --output-len 32 --concurrency 8 --hf-batch-size 8
-python -m minivllm.bench.bench --mode spec --spec-drafter ngram --num-spec-tokens 8
-# 全部支持 --output results.json（含 workload/metrics 全量字段，便于绘图）
-```
+## 9. 正确性验证
 
----
+1. **单元**（无模型依赖）：块管理/reservation 记账/哈希链双 backend/调度器预算与抢占/增量 stop/inverse-CDF 边界；
+2. **端到端 HF 对齐**：chunked×缓存×RNG×并行采样×抢占全组合逐 token 全等；
+3. **Correctness Matrix**：backend×模式×缓存×chunking 16 CPU 组合 + GPU triton==torch 行；
+4. **Kernel 数值矩阵**：758 组合（上文）；GQA 映射/块表乱序专用测试；
+5. **统计检验**：采样分布（4-token 50k）、投机解码无损（数万次）、GPU==CPU 同 seed；
+6. **property 不变量**：随机配置扫描 `computed≤tokens`、块表覆盖、reservation 收支平衡、free-list 一致。
 
-## 7. 正确性验证（怎么证明写得对）
+## 10. 面试要点速查
 
-1. **单元测试**（无模型依赖，秒级）：块分配/回收、LRU 驱逐、COW 语义、哈希链（双 backend）、调度器 FCFS/预算/抢占、**prefix cache 预算只按未缓存 token 扣除**（含只读探测、准入失败回滚、全命中强制重算）、**统一预算/chunk 边界**、增量 stop 检查。
-2. **随机小模型端到端**：2 层 64 维随机 Qwen2 同权重灌进我的实现和 HF，**fp32 CPU 下 greedy 输出逐 token 全等**——覆盖连续批处理、**chunked prefill 开/关/随机预算**、前缀缓存开/关、并行采样 n=3、极小池抢占。
-3. **Per-request RNG**：单独运行 vs 与他人同批、重复运行、到达顺序——seeded 请求输出全部一致；n=3 子序列随机流独立；greedy 不受影响。
-4. **投机解码**：greedy 全等；**n-gram + temperature>0** 分布无损（数万次统计检验，含点分布 proposal、top-k 支持集外 proposal、p==q 退化）；**EOS/stop 出现在 proposal 中途**逐 token 截断（单元 + 端到端）。
-5. **Property 不变量扫描**：随机 (block_size, 池大小, 预算, chunked, 缓存) 配置 × 随机 prompt，每步检查 `computed ≤ tokens`、块表覆盖计算前沿、refcount ≥ 1、不在 free list、缓存块只含已算满块，结束序列不占私有块——同时输出仍与 HF 全等。
-6. **真实模型 fp32 CPU**：首 token logits `max|Δ|=2.8e-5`；fp16 CUDA 多数 prompt 全等（分叉为 fp16 累计精度，vLLM 与 HF 间同样存在）。
+**Paged KV Cache 和 Paged Attention 的区别？** 前者是内存管理层（块化+block table+引用计数），后者是 kernel 层（按页直接计算 attention）。有前者没后者=要 gather 物化（v0.2）；两者齐备=kernel 直接页寻址（v0.3）。
 
----
+**为什么 gather+SDPA 不算真正的 PagedAttention？** 多一次全量 K/V 物化：额外显存流量+中间张量（B=64/ctx=8192 一层 256MiB/步）。真实收益要看 kernel 微基准：同场景 Triton 75x。
 
-## 8. 面试要点速查（每个点都对应本项目代码）
+**为什么每序列 `.item()` 拖慢 decode？** 每次都强制 GPU→CPU 同步，流水线被打断 B 次/步。
 
-**Q: 你的 scheduler 为什么这么设计？**
-统一 token 预算（decode 优先 + prefill chunk），一次 forward 服务尽量多 token；decode 是延迟敏感的多数派所以先分配；prefill 可切，decode 的 1 token 不可切。
+**为什么把 B×V 概率矩阵搬到 CPU 仍然不行？** 同步次数降了，但字节数是 O(B·V)——B=64/V=150k 每步 37.5MB PCIe 流量。正确形态是 O(B)：传 u 上去、传 id 下来，CDF 在 GPU 上算。
 
-**Q: Prefix Cache hit 后，scheduler 怎么知道真正要算多少 token？**
-准入前只读探测（`get_cached_prefix`，不动 ref_count）→ 未缓存 token 数过预算 → 通过才 `allocate`。全命中时强制重算最后一个 token 拿 logits。
+**怎么在保持 per-request RNG 下做 GPU batch sampling？** 随机数在 CPU 各自 Generator 产生（一个 u），只把 u 传上 GPU 做逆变换采样。采样结果=(该序列 logits, 该序列 u) 的纯函数。
 
-**Q: 长 prompt 为什么不会阻塞 decode？**
-chunked prefill：decode 先各拿 1 token，剩余预算给 prefill chunk，8K prompt 分 ~32 轮算完。实测 2048-token 场景 TTFT 4.0s → 2.0s。
+**Chunked prefill 为什么改善 decode latency？** 长 prompt 不再独占 iteration——decode 先各拿 1 token，剩余预算给 prefill chunk，TTFT 与 TPOT 解耦（2048-token 场景 TTFT 4.0s→2.0s）。
 
-**Q: KV 不够怎么抢占？抢占后为什么能恢复？**
-recompute 策略：从 running 队尾踢（最新请求），块全部释放。恢复靠前缀缓存：prompt 满块都注册过（chunked prefill 逐 chunk 注册），重调度只重算生成部分。
+**为什么 chunked prefill 不能无限 admission？** 计算可分片，但 KV 容量是硬约束。所以 v0.3 准入时登记整段容量（reservation）——不超额准入，物理块才敢惰性分配。
 
-**Q: 多个请求为什么不会互相影响 sampling RNG？**
-每序列独立 generator，seed 由 splitmix64 稳定混合派生；用户 seed 时不掺 request_id（vLLM 语义：同 seed 复现同输出，n>1 子序列靠 sample_idx 区分）。有批组成无关性测试。
+**Reservation 和 allocation 为什么分开？** 前者是准入控制的记账（未来最多要多少），后者是当下显存占用。混在一起=要么提前占显存压别人（eager），要么无界准入导致抢占风暴（无 reservation 的 lazy）。分离后两个策略独立可调（`scheduler_reserve_full_isl` × `lazy_block_allocation`）。
 
-**Q: Speculative Decoding 为什么分布无损？**
-接受概率 min(1, p/q) + 拒绝后从 norm(max(p-q,0)) 重采样，每个输出 token 边际分布恒为 p；确定性 drafter 是 q=onehot 的特例（接受率=p(x)）。统计检验直测分布。
+**Online softmax 为什么省？** 分块遍历时只维护 (m, l, acc) 三个标量/向量状态，attention score 从不整段存在——显存 O(1) 于块数，这是 flash attention 的核心思想。
 
-**Q: GPU decode 路径真正的 CPU synchronization 在哪里？**
-每序列采样结果的 `.item()/.cpu()`。批分组采样把 N 次同步降到每组 1 次（实测 B=64 提速 3.0x）；此外调度器/块管理的纯 Python 逻辑是第二步瓶颈（→ CUDA graph 的动机）。
+**GQA 的 head 映射？** `kv_head = q_head // group_size`，group_size=H/kvh 编译期常量；数值上等价于 K/V repeat_interleave。
 
-**Q: Paged KV 和真正的 Paged Attention kernel 有什么区别？**
-本项目：按 block table gather 成连续 K/V 再 SDPA（多一次物化）；真实 vLLM：融合 kernel 直接遍历物理块 + online softmax（省 gather、省启动）。内存语义相同，性能差在 kernel 融合与启动开销。
+**Triton kernel 为什么长 context 收益大？** gather 物化成本 ∝ ctx（且是完整中间张量），kernel 页寻址成本 ∝ KV 理论读取量；ctx 越长差比越大（8192 时 75x）。
 
-**Q: 与真实 vLLM 还差什么？**
-融合 paged-attention kernel（FlashDecoding）、CUDA graph、TP/PP 多卡、FP8 KV、按 chunk 惰性块分配（本项目准入时整 prompt 预留——保守但无死锁，V1 是惰性分配+可抢占 prefill）、投机解码 × continuous batching 组合、异步 server / OpenAI API。
+**为什么 throughput 和 latency profiling 要分开测？** 逐 token synchronize 的 profiler 会人为放大同步开销——拿它测吞吐等于惩罚对手。吞吐用原生 generate（只在区间两端同步），延迟才用逐步 profiler 并明确标注。
 
----
+**CUDA Graph 能解决什么？** 消 kernel launch + CPU 调度开销。本机 profile 显示 CPU 侧已 <3ms/步（GPU-bound），收益有限；且只适合 shape 固定的 all-decode 批——prefill/varlen 不行。这不是万能药。
+
+**与 production vLLM 的关键差距？** 无 TP/PP 多卡、无 FP8 KV、CUDA Graph 未实测、投机解码未与 continuous batching 组合、chunked logits/lm_head 分块缺失、无异步 server。但内存层/调度层/采样/kernel 四层的机制与权衡已同构且可用数据回答。
 
 ## 项目结构
 
 ```
 mini-vllm/
 ├── minivllm/
-│   ├── config.py            # EngineConfig（含 chunked prefill / hash backend）+ KV 大小计算
-│   ├── sequence.py          # Sequence / SamplingParams / per-request RNG 状态
-│   ├── kv_pool.py           # 物理块池大张量 [blocks, layers, 2, kvh, bs, dim]
-│   ├── block_manager.py     # ★ 逻辑块→物理块、引用计数、COW、LRU、只读缓存探测、抢占
-│   ├── prefix_hash.py       # 可插拔 hash backend（tuple / sha256）
-│   ├── attention.py         # RoPE / 分页 KV 写入+聚合 / 批量 decode SDPA / GQA
-│   ├── model.py             # Qwen2（RMSNorm/SwiGLU/RoPE），varlen 平铺批前向
-│   ├── scheduler.py         # ★ 统一 token 预算：decode 优先 + chunked prefill + FCFS + 抢占
-│   ├── engine.py            # step 主循环（span 化）/ 请求组 / fork / stop 检查 / 统计
-│   ├── sampling.py          # ★ filter/probs + derive_seed + 分组批量采样（每组 ≤1 次同步）
-│   ├── stopping.py          # 增量 stop 检查（token fast path + 窗口 decode）
-│   ├── spec/
-│   │   ├── drafters.py      # NGramDrafter（prompt lookup）/ ModelDrafter
-│   │   ├── worker.py        # 单序列 paged-KV worker（draft 复用）
-│   │   └── spec_engine.py   # ★ draft-then-verify + 无损拒绝采样 + 中途截断
+│   ├── config.py            # EngineConfig（backend/chunking/reservation 策略）
+│   ├── sequence.py          # Sequence / SamplingParams / RNG / reservation
+│   ├── kv_pool.py           # 物理块池 [blocks, layers, 2, kvh, bs, dim]
+│   ├── block_manager.py     # ★ 分页内存 + 只读探测 + reservation/lazy allocation
+│   ├── prefix_hash.py       # 可插拔 hash backend（tuple/sha256，metadata 入根）
+│   ├── attention.py         # RoPE / 分页 KV 读写 / 批量 SDPA / GQA（torch 路径）
+│   ├── kernels/
+│   │   └── paged_attention.py  # ★ Triton decode kernel（online softmax, GQA）+ torch 参考
+│   ├── model.py             # Qwen2 varlen 前向（backend 分派：triton/torch）
+│   ├── scheduler.py         # ★ 统一预算 + chunked prefill + reservation 语义
+│   ├── engine.py            # step 循环 / 持久化 metadata / stop 检查 / profiler 钩子
+│   ├── sampling.py          # ★ derive_seed + GPU-native inverse-CDF 批量采样
+│   ├── stopping.py          # 增量 stop（token fast path + 窗口 fallback）
+│   ├── spec/                # 投机解码（ngram/model drafter，committed-stream stop）
 │   └── bench/
-│       ├── bench.py         # compare / spec / sampling 三模式，中位数+percentile+JSON
-│       └── prefix_hash_bench.py
-├── tests/                   # 92 个测试（单元 + 端到端 + 统计检验 + property 不变量）
-├── examples/                # 生成 / 前缀缓存 / 投机解码 demo
-├── pyproject.toml           # pip install -e . + ruff + pytest 配置
-└── .github/workflows/ci.yml # Python 3.10/3.11/3.12 · CPU · ruff + pytest
+│       ├── bench.py         # compare / spec / sampling / scheduler 四模式
+│       ├── paged_attention_bench.py
+│       ├── prefix_hash_bench.py
+│       └── profile_runtime.py   # 逐阶段 step profiler
+├── tests/                   # 889 个测试（CPU 全量 + gpu/triton marker 隔离）
+├── examples/
+├── pyproject.toml           # pip install -e . + ruff + pytest markers
+└── .github/workflows/ci.yml # py3.10-3.12 · CPU · ruff + pytest(-m "not gpu")
 ```
 
 ## 已知限制
 
-- 纯 PyTorch 前向，无融合 kernel / CUDA graph → 单流吞吐低于 HF（见 benchmark 一节）；
-- 投机解码未与 continuous batching 组合（vLLM 早期同样分开处理），批内 n=1；
-- chunked prefill 的块分配是准入时整 prompt 预留（保守、无死锁），非 V1 的逐 chunk 惰性分配；
-- stop string 的窗口 decode 在极端 BPE 边界情况下理论上可能差一个 token 的截断精度（窗口内已尽力精确）；
-- transformers 5.x 加载（老版本 transformers 未测）。
+- CUDA Graph：架构就绪（固定 shape metadata buffer）、`enable_cuda_graph` 预留、**未实测**——本机 CPU 侧开销已 <3ms/步，收益预期有限，不编数据；
+- Triton kernel 只覆盖 decode（q_len=1）；prefill 走 torch 路径（flash attention 型 prefill kernel 是下一个大项）；
+- 投机解码未与 continuous batching 组合；
+- stop string 窗口 decode 在极端 BPE 边界下理论上可能差一个 token 的截断精度；
+- bf16 kernel 测试依赖 GPU bf16 支持（不支持时自动 skip）。

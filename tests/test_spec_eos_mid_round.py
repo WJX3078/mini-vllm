@@ -158,5 +158,144 @@ def test_greedy_ngram_pipeline_still_matches_hf():
         assert o.token_ids == ref[i]
 
 
+
+
+# --------------------------------------------- stop-stream semantics (v0.3)
+class _IdTok:
+    """Stub tokenizer: encode maps chosen strings to chosen token lists;
+    decode maps token ids through a dict (text fallback uses it)."""
+
+    def __init__(self, enc_map, dec_map):
+        self._enc, self._dec = enc_map, dec_map
+
+    def encode(self, s, add_special_tokens=False):
+        return self._enc[s]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self._dec.get(i, "?") for i in ids)
+
+
+class _ScriptedDrafter:
+    """Deterministic stand-in for the drafter: yields a fixed proposal list
+    for the first round, then nothing. Lets tests place stop tokens inside
+    REJECTED proposals with full control."""
+
+    def __init__(self, first_round):
+        self.first_round = first_round
+        self.done = False
+
+    def reset(self):
+        self.done = False
+
+    def sync(self, tokens):
+        pass
+
+    def propose(self, tokens, gamma):
+        if self.done:
+            return []
+        self.done = True
+        return self.first_round[:gamma]
+
+
+def _scripted_engine(first_round):
+    """Spec engine with a scripted drafter proposing `first_round` tokens
+    that the greedy target model does NOT produce (ids chosen outside the
+    prompt echo set); asserts k=0 and returns (eng, prompt, raw_ids)."""
+    import pytest
+    from helpers import make_tiny_spec_engine, random_prompts
+
+    from minivllm.sequence import SamplingParams
+    for extra in range(200, 250):
+        eng, _hf = make_tiny_spec_engine(seed=0, drafter="ngram",
+                                         num_spec_tokens=4)
+        prompt = random_prompts(1, min_len=8, max_len=8, seed=71)[0]
+        first_round = [extra, extra + 1, extra + 2, extra + 3]
+        eng.ngram_drafter = _ScriptedDrafter(first_round)
+        raw = eng.generate([prompt], SamplingParams(
+            temperature=0.0, max_tokens=12, ignore_eos=True),
+            use_tqdm=False)[0]
+        if raw.token_ids[0] not in first_round:     # round 1: k=0, all rejected
+            return eng, prompt, raw.token_ids
+    pytest.skip("no scripted proposal id produced a rejected round")
+
+
+def test_rejected_proposal_stop_does_not_stop():
+    """Bug A regression: a stop string completed by the TAIL of a rejected
+    proposal run must not stop generation (the buggy code checked the
+    history+ALL-proposals stream, whose suffix matched)."""
+    from minivllm.sequence import SamplingParams
+    stop_tok = 249
+    eng, prompt, raw_ids = _scripted_engine([91, 92, 93, stop_tok])
+    assert raw_ids[0] != 91                          # precondition: k = 0
+    eng2, prompt2, _raw = _scripted_engine([91, 92, 93, stop_tok])
+    eng2.tokenizer = _IdTok({"S": [stop_tok]}, {})
+    out = eng2.generate([prompt2], SamplingParams(
+        temperature=0.0, max_tokens=12, ignore_eos=True,
+        stop=["S"]), use_tqdm=False)[0]
+    # buggy code stopped at round 1 (candidate suffix == rejected proposal
+    # tail == stop token); the fix keeps generating to the length cap
+    assert len(out.token_ids) == 12
+
+
+def test_bonus_token_completing_stop_stops():
+    """Bug B regression: the bonus token completing a stop string must stop,
+    even though the bonus is not part of the proposal stream (the buggy
+    code's checked stream ended with rejected proposals, so it never saw
+    the stop completion)."""
+    from minivllm.sequence import SamplingParams
+    eng, prompt, raw_ids = _scripted_engine([91, 92, 93, 94])
+    bonus_tok = raw_ids[0]                           # k=0: first commit = bonus
+    eng2, prompt2, _raw = _scripted_engine([91, 92, 93, 94])
+    eng2.tokenizer = _IdTok({"S": [bonus_tok]}, {})
+    out = eng2.generate([prompt2], SamplingParams(
+        temperature=0.0, max_tokens=12, ignore_eos=True,
+        stop=["S"]), use_tqdm=False)[0]
+    # the stop string completed at the bonus and is excluded from the
+    # output (same semantics as the plain engine) -> zero-token generation
+    assert out.token_ids == []
+
+
+def test_accepted_proposal_completing_stop_truncates():
+    """Accepted proposals that complete a stop string are cut before the
+    stop tokens; the committed stream (not the proposal stream) decides."""
+    eng, _hf = make_tiny_spec_engine(seed=0, drafter="ngram")
+    eng.tokenizer = _IdTok({"S": [30]}, {})
+    checker = StopChecker(eng.tokenizer, ["S"], [0])
+    history = [5, 6]
+    committed = [10, 20, 30]                        # 30 completes the stop
+    keep, terminated = eng._round_keep_count(
+        history + committed, base=len(history), committed=committed,
+        params=SamplingParams(max_tokens=32), checker=checker)
+    assert (keep, terminated) == (2, True)          # stop token dropped
+
+
+def test_eos_stop_max_tokens_earliest_wins():
+    """EOS, stop strings and max_tokens compete inside one round: the
+    earliest token position terminates, max_tokens is a hard length cap."""
+    eng, _hf = make_tiny_spec_engine(seed=0, drafter="ngram")
+    eng.tokenizer = _IdTok({"S": [11]}, {"11": "K"})
+    checker = StopChecker(eng.tokenizer, ["S"], [0])
+    P = SamplingParams(max_tokens=32)
+
+    # EOS at index 1 beats a stop that would complete at index 2
+    committed = [10, 0, 11, 12]
+    keep, terminated = eng._round_keep_count(
+        [5] + committed, 1, committed, P, checker)
+    assert (keep, terminated) == (2, True)          # [10, EOS], not stop cut
+
+    # max_tokens caps BEFORE a later EOS: length finish, not stop
+    # (base=1 history token, room = 2-1 = 1)
+    committed = [10, 11, 0]
+    keep, terminated = eng._round_keep_count(
+        [5] + committed, 1, committed,
+        SamplingParams(max_tokens=2, ignore_eos=True), checker)
+    assert (keep, terminated) == (1, False)
+
+    # EOS before the cap still wins as a stop event
+    keep, terminated = eng._round_keep_count(
+        [5] + committed, 1, committed, P, checker)
+    assert (keep, terminated) == (3, True)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

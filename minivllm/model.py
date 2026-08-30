@@ -63,9 +63,19 @@ class Qwen2Layer(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, cfg: ModelConfig, device: str = "cpu", dtype: torch.dtype = torch.float32):
+    def __init__(self, cfg: ModelConfig, device: str = "cpu",
+                 dtype: torch.dtype = torch.float32,
+                 attention_backend: str = "auto"):
         super().__init__()
         self.cfg = cfg
+        # decode-path attention: "torch" (gather + SDPA) or "triton"
+        # (page-aware kernel, CUDA + Triton only)
+        from minivllm.kernels.paged_attention import triton_available
+        if attention_backend == "auto":
+            attention_backend = "triton"                 if (device == "cuda" and triton_available()) else "torch"
+        if attention_backend == "triton":
+            assert device == "cuda" and triton_available(),                 "attention_backend='triton' requires CUDA + Triton"
+        self.attention_backend = attention_backend
         self.embed_tokens = nn.Parameter(
             torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=dtype, device=device))
         self.layers = nn.ModuleList(Qwen2Layer(cfg, dtype, device) for _ in range(cfg.num_layers))
@@ -183,17 +193,30 @@ class Qwen2ForCausalLM(nn.Module):
                 # one indexed write for every sequence's new K/V
                 k_view[phys, :, slots, :] = k
                 v_view[phys, :, slots, :] = v
-                # one gather + one SDPA for the whole batch
-                kk = k_view[table_t]                             # [S, nb, kvh, bs, D]
-                vv = v_view[table_t]
-                kk = kk.permute(0, 2, 1, 3, 4).reshape(T, kvh, -1, D)[:, :, :max_ctx]
-                vv = vv.permute(0, 2, 1, 3, 4).reshape(T, kvh, -1, D)[:, :, :max_ctx]
-                # each query attends to tokens 0..positions[i] (its own context)
-                mask = (torch.arange(max_ctx, device=x.device)[None, None, None, :]
-                        <= positions[:, None, None, None])       # [S,1,1,ctx]
-                out = _sdpa(q[:, :, None],                       # [S, H, 1, D]
-                            kk, vv, mask, D ** -0.5, H, kvh)
-                attn_out = out[:, :, 0, :].reshape(T, q_out)
+                if self.attention_backend == "triton":
+                    # page-aware kernel: walks the block table directly in
+                    # the pool -- no contiguous K/V is materialized
+                    from minivllm.kernels.paged_attention import (
+                        paged_attention_decode_triton,
+                    )
+                    context_lens = torch.tensor([si.ctx_len
+                                                 for si in seq_inputs],
+                                                device=x.device)
+                    attn = paged_attention_decode_triton(
+                        q, k_view, v_view, table_t, context_lens, D ** -0.5)
+                    attn_out = attn.reshape(T, q_out)
+                else:
+                    # one gather + one SDPA for the whole batch
+                    kk = k_view[table_t]                         # [S, nb, kvh, bs, D]
+                    vv = v_view[table_t]
+                    kk = kk.permute(0, 2, 1, 3, 4).reshape(T, kvh, -1, D)[:, :, :max_ctx]
+                    vv = vv.permute(0, 2, 1, 3, 4).reshape(T, kvh, -1, D)[:, :, :max_ctx]
+                    # each query attends to tokens 0..positions[i] (its own context)
+                    mask = (torch.arange(max_ctx, device=x.device)[None, None, None, :]
+                            <= positions[:, None, None, None])   # [S,1,1,ctx]
+                    out = _sdpa(q[:, :, None],                   # [S, H, 1, D]
+                                kk, vv, mask, D ** -0.5, H, kvh)
+                    attn_out = out[:, :, 0, :].reshape(T, q_out)
             else:
                 attn_out = torch.empty(T, q_out, dtype=x.dtype, device=x.device)
                 for si in seq_inputs:

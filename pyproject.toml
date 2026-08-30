@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minivllm"
-version = "0.2.0"
+version = "0.3.0"
 description = "A from-scratch mini vLLM inference engine: block-level KV cache (PagedAttention), continuous batching + chunked prefill, prefix caching, speculative decoding -- pure PyTorch, built for learning inference systems"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ include = ["minivllm*"]
 testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA device (deselect with -m 'not gpu')",
+    "triton: requires the Triton runtime (GPU; deselect with -m 'not triton')",
     "slow: long-running tests",
 ]
 

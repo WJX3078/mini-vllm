@@ -1,20 +1,20 @@
 """Pluggable prefix-cache hash backends.
 
 A prefix-cache key must satisfy: key_i == key_j  <=>  the token prefixes
-[0, block_i) and [0, block_j) are identical. The chain structure
-(parent_hash, block_tokens) gives this structurally; the backend only picks
-the concrete representation:
+[0, block_i) and [0, block_j) are identical AND both were produced under the
+same `metadata` (model identity today). The chain structure gives the
+prefix property; the backend picks the concrete representation:
 
-* TupleBackend   -- nested Python tuples. Equality is structural comparison,
-                   so correctness is trivially airtight (no collisions), but
-                   each key holds the whole ancestor chain: O(depth) memory
-                   and O(depth) compare on long contexts.
+* TupleBackend   -- chained tuples with the metadata as a synthetic root:
+                   key = (("metadata", meta), blk0, blk1, ...). Equality is
+                   structural comparison, so correctness is airtight (no
+                   collisions), but each key holds its whole ancestor chain:
+                   O(depth) memory and O(depth) compare on long contexts.
 
-* SHA256Backend  -- fixed-size 32-byte digest chaining
-                   H_i = SHA256(parent || tokens || metadata). O(1) memory
-                   per key, O(1) compare. Cryptographic collisions are the
-                   same trade-off production vLLM makes when it uses
-                   (partial) hashing for cache keys.
+* SHA256Backend  -- fixed-size 32-byte digests:
+                   H_i = SHA256(H_{i-1} || tokens || metadata). O(1) memory
+                   and compare per key. Cryptographic collisions are the
+                   same trade-off production vLLM makes with partial hashes.
 
 `metadata` folds engine-scoped facts into the root of the chain (model
 identity today). Production systems additionally salt the hash with LoRA
@@ -24,6 +24,11 @@ computation* is identical, otherwise a hit silently serves wrong values.
 """
 import hashlib
 import struct
+from collections.abc import Hashable
+
+#: A prefix-cache key: tuple-chains for TupleBackend, 32-byte digests for
+#: SHA256Backend. Hashable covers both.
+HashKey = Hashable
 
 
 class PrefixHashBackend:
@@ -31,19 +36,22 @@ class PrefixHashBackend:
 
     name = "base"
 
-    def hash_block(self, parent_hash, block_tokens: tuple[int, ...],
-                   metadata: str) -> object:
+    def hash_block(self, parent_hash: HashKey | None,
+                   block_tokens: tuple[int, ...], metadata: str) -> HashKey:
         raise NotImplementedError
 
 
 class TupleBackend(PrefixHashBackend):
-    """Chained tuples: key = (parent_key, tokens). Structural equality."""
+    """Chained tuples rooted at ("metadata", metadata): model identity is
+    part of every key, so different engines/models can never collide."""
 
     name = "tuple"
 
     def hash_block(self, parent_hash: tuple | None,
                    block_tokens: tuple[int, ...], metadata: str) -> tuple:
-        return (parent_hash if parent_hash is not None else (), block_tokens)
+        if parent_hash is None:
+            return (("metadata", metadata), block_tokens)
+        return (parent_hash, block_tokens)
 
 
 class SHA256Backend(PrefixHashBackend):

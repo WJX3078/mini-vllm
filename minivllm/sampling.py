@@ -1,6 +1,7 @@
-"""Sampling: temperature / top-k / top-p, per-request RNG, batched sampling.
+"""Sampling: temperature / top-k / top-p, per-request RNG, GPU-native
+batched sampling.
 
-Three concerns live here:
+Four concerns live here:
 
 1. Filter math (temperature / top-k / top-p) -- shared by engine decoding and
    speculative-decoding verification. All helpers accept a leading batch dim.
@@ -15,13 +16,26 @@ Three concerns live here:
    composition, and parallel-sampling children (different sample_idx) get
    independent streams.
 
-3. Batched sampling. Per-sequence ``.item()`` / ``.cpu()`` calls force a
-   GPU->CPU sync per sequence per step; with B sequences that is B syncs
-   per decode step. ``sample_tokens`` groups sequences by sampling
-   configuration, runs filter+softmax once per group on the GPU, and does at
-   most ONE D2H transfer per group. The final per-sequence multinomial runs
-   on CPU against that group's probs, using each sequence's own generator --
-   so batching never changes the RNG semantics.
+3. GPU-native batched sampling. Per-sequence ``.item()`` forces B GPU->CPU
+   syncs per decode step; the v0.2 fix moved the whole [B, vocab] probability
+   matrix to the CPU (one D2H -- but O(B*V) bytes: at B=64, V=150k fp32 that
+   is ~38 MB *per step*). This version keeps everything on the sampling
+   device and moves only O(B) data:
+
+       CPU  : each sequence's own generator draws ONE uniform  u_i
+       H2D  : [B] float32 uniforms
+       GPU  : filter (temperature/top-k/top-p) -> softmax -> cumulative sum
+              -> inverse CDF:  token_i = #{ j : cdf_j <= u_i }
+       D2H  : [B] int64 token ids
+
+   so the D2H traffic drops from O(B*V) to O(B). RNG semantics are
+   unchanged: the uniform still comes from each sequence's private CPU
+   generator, so batch composition cannot influence any request.
+
+4. One sampling primitive everywhere. ``sample_from_logits`` (single
+   sequence, used by speculative drafting/verification) and the batched
+   ``sample_tokens`` draw the SAME u from the generator and apply the SAME
+   inverse-CDF rule, so equal generator state => equal token on both paths.
 """
 from collections.abc import Sequence as SeqT
 
@@ -75,17 +89,39 @@ def filter_logits(logits: torch.Tensor, temperature: float = 1.0,
     return logits
 
 
+# ------------------------------------------------------- inverse-CDF sampling
+def _inverse_cdf(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
+    """Map uniforms [B] through the CDF of probs [B, V]: token_i is the
+    first index whose cumulative probability exceeds u_i. For u ~ U[0,1)
+    this samples exactly from probs. The final clamp covers float rounding
+    at u -> 1 (cdf[-1] may fall a few ulp short of 1.0)."""
+    cdf = probs.cumsum(dim=-1)
+    tokens = (cdf <= uniforms[:, None]).sum(dim=-1)
+    return tokens.clamp_max_(probs.shape[-1] - 1)
+
+
 def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0,
                        top_k: int = -1, top_p: float = 1.0,
                        generator: torch.Generator | None = None) -> int:
-    """Sample one token id (single sequence). temperature==0 means greedy."""
+    """Sample one token id (single sequence). temperature==0 means greedy.
+
+    Draws exactly one uniform from `generator` and applies the inverse-CDF
+    rule -- the same primitive the batched GPU path uses, so equal
+    generator state yields equal tokens on both paths."""
     if temperature == 0.0:
         return int(torch.argmax(logits, dim=-1).item())
     logits = filter_logits(logits, temperature, top_k, top_p)
-    probs = torch.softmax(logits, dim=-1)
-    # multinomial on CPU: keeps the generator device-independent
-    return int(torch.multinomial(probs.detach().float().cpu(), num_samples=1,
-                                 generator=generator).item())
+    probs = torch.softmax(logits, dim=-1).float()
+    u = torch.rand((), generator=generator).to(probs.device)
+    return int(_inverse_cdf(probs[None], u[None])[0].item())
+
+
+def sample_from_probs(probs: torch.Tensor,
+                      generator: torch.Generator) -> int:
+    """Inverse-CDF sample from a ready probability row (speculative
+    decoding's rejection-residual / bonus draws). One uniform per call."""
+    u = torch.rand((), generator=generator)
+    return int(_inverse_cdf(probs.float()[None], u[None])[0].item())
 
 
 def probs_from_logits(logits: torch.Tensor, temperature: float = 1.0,
@@ -112,17 +148,21 @@ def probs_batch_from_logits(logits: torch.Tensor, temperature: float,
 
 # ------------------------------------------------------------ batched sampling
 def sample_tokens(logits: torch.Tensor, seqs: SeqT) -> list[int]:
-    """Sample one token per sequence for a whole batch with minimal syncs.
+    """Sample one token per sequence for a whole batch, GPU-native.
 
     logits: [S, vocab] on any device. seqs[i] must expose
     ``sampling_params`` and ``sampling_generator()``.
 
-    Sequences are grouped by (temperature, top_k, top_p):
-      * greedy group: one batched argmax, one D2H for the whole group;
-      * sampled group: one batched filter+softmax on the GPU, ONE D2H of the
-        group's probs, then per-sequence CPU multinomial against the group's
-        own generator. Per-request RNG independence is preserved exactly:
-        each sequence consumes only its own generator stream.
+    Data movement per sampling-config group (v0.2 -> v0.3):
+        greedy : one batched argmax, one [G] D2H              (unchanged)
+        sampled: filter+softmax+cumsum on device; the ONLY
+                 cross-device traffic is [G] float32 H2D
+                 (uniforms from each sequence's private CPU
+                 generator) + [G] int64 D2H (token ids) --
+                 O(B), never O(B*vocab).
+
+    Per-request RNG independence is exact: each sequence's token is a pure
+    function of (its logits row, the uniform from its own generator).
     """
     groups: dict[tuple, list[int]] = {}
     for i, seq in enumerate(seqs):
@@ -130,19 +170,21 @@ def sample_tokens(logits: torch.Tensor, seqs: SeqT) -> list[int]:
         groups.setdefault((p.temperature, p.top_k, p.top_p), []).append(i)
 
     out: list[int] = [0] * len(seqs)
+    device = logits.device
     for (temperature, top_k, top_p), idxs in groups.items():
-        sub = logits[idxs]                                    # [g, vocab] (GPU)
+        sub = logits[idxs]                                    # [g, vocab]
         if temperature == 0.0:
             toks = torch.argmax(sub, dim=-1)
         else:
-            probs = probs_batch_from_logits(sub, temperature, top_k, top_p)
-            probs_cpu = probs.detach().float().cpu()          # the one D2H
-            for row, i in enumerate(idxs):
-                out[i] = int(torch.multinomial(
-                    probs_cpu[row], num_samples=1,
-                    generator=seqs[i].sampling_generator()).item())
-            continue
-        out_ids = toks.cpu().tolist()                         # the one D2H
+            probs = probs_batch_from_logits(sub, temperature, top_k,
+                                            top_p).float()
+            # one uniform per sequence, from its OWN CPU generator
+            uniforms = torch.tensor(
+                [torch.rand((), generator=seqs[i].sampling_generator()).item()
+                 for i in idxs], dtype=torch.float32, device=device)
+            toks = _inverse_cdf(probs, uniforms)
+        # the group's single D2H: [G] token ids
+        ids = toks.cpu().tolist()
         for row, i in enumerate(idxs):
-            out[i] = int(out_ids[row])
+            out[i] = int(ids[row])
     return out

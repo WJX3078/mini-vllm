@@ -116,7 +116,7 @@ def test_lru_eviction_of_cached_blocks():
     b = make_seq([2] * 12)                          # needs 3 blocks -> must evict
     bm.allocate_sequence(b)
     assert 0 in b.block_table                       # LRU victim (block 0) reused
-    old_key = bm._block_key(None, (1, 1, 1, 1))
+    old_key = bm._key_for(None, (1, 1, 1, 1))
     assert old_key not in bm.cached_blocks
     assert bm.blocks[0].ref_count == 1
 
@@ -154,8 +154,12 @@ def test_register_uses_chained_keys():
     a = make_seq(list(range(8)) + [50, 51])
     bm.allocate_sequence(a)
     bm.register_filled_blocks(a, 8)
-    k0 = bm._block_key(None, (0, 1, 2, 3))
-    k1 = bm._block_key(k0, (4, 5, 6, 7))
+    # tuple-backend keys are rooted at ("metadata", metadata): model identity
+    # is part of every key, chains extend per full block
+    k0 = bm._key_for(None, (0, 1, 2, 3))
+    k1 = bm._key_for(k0, (4, 5, 6, 7))
+    assert k0 == (("metadata", ""), (0, 1, 2, 3))
+    assert k1 == (k0, (4, 5, 6, 7))
     assert bm.blocks[a.block_table[0]].key == k0
     assert bm.blocks[a.block_table[1]].key == k1
     # a prompt sharing the chain but ending differently still hits block 0 only

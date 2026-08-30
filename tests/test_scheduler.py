@@ -12,12 +12,14 @@ from minivllm.scheduler import Scheduler
 from minivllm.sequence import SamplingParams, Sequence, SequenceStatus
 
 
-def make_sched(num_blocks=4, block_size=4, max_num_seqs=8, max_tokens_budget=64):
+def make_sched(num_blocks=4, block_size=4, max_num_seqs=8, max_tokens_budget=64,
+               enable_chunked_prefill=True):
     bm = BlockSpaceManager(num_blocks=num_blocks, block_size=block_size,
                            num_layers=1, num_kv_heads=1, head_dim=4,
                            dtype=torch.float32, device="cpu",
                            enable_prefix_caching=True)
-    return Scheduler(bm, max_num_seqs, max_tokens_budget), bm
+    return Scheduler(bm, max_num_seqs, max_tokens_budget,
+                     enable_chunked_prefill=enable_chunked_prefill), bm
 
 
 def test_fcfs_admission_order():
@@ -151,6 +153,40 @@ def test_fully_cached_prompt_forces_recompute_of_last_token():
     out = sched.schedule()
     assert b in out.scheduled
     assert b.num_computed_tokens == 7               # 8 - 1: recompute last token
+
+
+def test_chunked_prefill_disabled_strict_partial_blocked():
+    """The task's exact scenario: budget=100, decode work=20, waiting prompt
+    with 90 uncached tokens.
+      * OFF: 90 > 80 remaining budget -> NOT admitted;
+      * ON : chunk of 80 admitted this iteration."""
+    def scenario(chunked):
+        sched, bm = make_sched(num_blocks=64, block_size=8, max_num_seqs=32,
+                               max_tokens_budget=100,
+                               enable_chunked_prefill=chunked)
+        # 20 tokens of decode work this iteration: 4 decode sequences x 5? --
+        # decodes are 1 token each; use 20 running decode sequences.
+        decodes = [Sequence(list(range(4)), SamplingParams(max_tokens=50))
+                   for _ in range(20)]
+        for d in decodes:
+            sched.add(d)
+        sched.schedule()
+        for d in decodes:
+            d.num_computed_tokens = 4
+            d.output_token_ids.append(1)            # all become decode steps
+        waiting = Sequence(list(range(90)), SamplingParams())
+        sched.add(waiting)
+        out = sched.schedule()                      # 20 decodes + admission
+        return waiting, out
+
+    waiting_off, out_off = scenario(chunked=False)
+    assert waiting_off not in out_off.scheduled     # 90 > 100-20: stays WAITING
+    assert out_off.num_new_tokens == 20             # only the decodes ran
+
+    waiting_on, out_on = scenario(chunked=True)
+    span = out_on.spans[out_on.scheduled.index(waiting_on)]
+    assert span == (0, 80)                          # partial prefill admitted
+    assert out_on.num_new_tokens == 100             # 20 decodes + 80 chunk
 
 
 if __name__ == "__main__":

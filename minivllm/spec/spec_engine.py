@@ -25,7 +25,7 @@ import torch
 from minivllm.config import EngineConfig, ModelConfig
 from minivllm.engine import LLMEngine
 from minivllm.model import Qwen2ForCausalLM
-from minivllm.sampling import filter_logits
+from minivllm.sampling import filter_logits, sample_from_probs
 from minivllm.sequence import SamplingParams, Sequence, SequenceStatus
 from minivllm.spec.drafters import ModelDrafter, NGramDrafter
 from minivllm.spec.worker import KVWorker
@@ -114,7 +114,8 @@ class SpeculativeEngine:
         cfg = ModelConfig.from_pretrained(path)
         hf = AutoModelForCausalLM.from_pretrained(path, torch_dtype=self.dtype,
                                                   attn_implementation="eager")
-        model = Qwen2ForCausalLM(cfg, self.device, self.dtype)
+        model = Qwen2ForCausalLM(cfg, self.device, self.dtype,
+                                 attention_backend=self.config.attention_backend)
         model.load_from_hf(hf)
         del hf
         return model, cfg
@@ -148,7 +149,7 @@ class SpeculativeEngine:
         # p_all[i]: target distribution at verify position i  [gamma+1, V]
         p_all = torch.softmax(filter_logits(
             target_logits.cpu(), params.temperature,
-            params.top_k, params.top_p), dim=-1)
+            params.top_k, params.top_p), dim=-1).float()
         g = generator
         for i in range(gamma):
             p_i = p_all[i]
@@ -176,9 +177,9 @@ class SpeculativeEngine:
                 residual = p_i
             else:
                 residual = residual / total
-            return i, int(torch.multinomial(residual, 1, generator=g).item())
+            return i, sample_from_probs(residual, g)
         # all proposals accepted: the bonus comes from p at the last position
-        return gamma, int(torch.multinomial(p_all[gamma], 1, generator=g).item())
+        return gamma, sample_from_probs(p_all[gamma], g)
 
     # ------------------------------------------------------------- generate
     @torch.no_grad()
@@ -206,10 +207,13 @@ class SpeculativeEngine:
                           checker: StopChecker | None) -> tuple:
         """How many of this round's committed tokens survive?
 
-        Scans accepted proposals + bonus in order and cuts at the EARLIEST
-        termination: EOS (kept as the final token, vLLM convention) or a
-        stop string (cut before the tokens completing it). max_tokens is
-        enforced last as a hard cap on the commit size.
+        ``candidate_ids`` MUST be history + committed tokens (the caller
+        builds it): stop checking never sees rejected proposals (they would
+        cause false stops) and always sees the bonus token (it may complete
+        a stop string). Cuts at the EARLIEST termination: EOS (kept as the
+        final token, vLLM convention) or a stop string (cut before the
+        tokens completing it). max_tokens is enforced last as a hard cap on
+        the commit size.
         Returns (keep, terminated)."""
         keep = len(committed)
         terminated = False
@@ -300,10 +304,15 @@ class SpeculativeEngine:
             out.num_accepted += k
 
             # ---- commit: accepted proposals + bonus, cut at the earliest
-            # termination inside the round (EOS/stop may sit mid-run)
+            # termination inside the round (EOS/stop may sit mid-run).
+            # The stop-checked stream is history + COMMITTED tokens only --
+            # never the rejected proposals (a stop string inside a rejected
+            # proposal must not stop generation) and never missing the bonus
+            # (a stop string completed by the bonus must stop).
             committed = proposals[:k] + [bonus_tok]
+            candidate_ids = tseq.output_token_ids[:base] + committed
             keep, terminated = self._round_keep_count(
-                tseq.output_token_ids, base, committed, p, checker)
+                candidate_ids, base, committed, p, checker)
             del tseq.output_token_ids[base:]                  # drop proposals+old bonus
             tseq.output_token_ids.extend(committed[:keep])
             for _ in committed[:keep]:

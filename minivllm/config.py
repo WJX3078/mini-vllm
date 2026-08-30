@@ -27,6 +27,18 @@ class EngineConfig:
     enable_chunked_prefill: bool = True       # False = legacy: a whole prompt must fit
                                               # in one scheduling iteration
 
+    # KV capacity reservation vs physical allocation (v0.3): admission
+    # checks/books the full cold-prompt capacity (reserve_full_isl) while
+    # physical blocks materialize lazily per scheduled span
+    # (lazy_block_allocation). Eager materialization is kept for A/B runs.
+    scheduler_reserve_full_isl: bool = True
+    lazy_block_allocation: bool = True
+
+    # Attention backend for the decode fast path (q_len == 1): "auto" picks
+    # Triton when the runtime supports it, else the PyTorch gather+SDPA
+    # path. "torch" / "triton" force one side.
+    attention_backend: str = "auto"           # "auto" | "torch" | "triton"
+
     enable_prefix_caching: bool = True
     hash_backend: str = "tuple"               # prefix-cache key backend: "tuple" | "sha256"
     seed: int = 1234

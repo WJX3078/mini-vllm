@@ -2,8 +2,12 @@
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:  # type alias only; avoids a runtime import cycle
+    from minivllm.prefix_hash import HashKey
 
 
 class SequenceStatus(Enum):
@@ -66,7 +70,8 @@ class Sequence:
 
         # Managed by BlockSpaceManager
         self.block_table: list[int] = []
-        self.block_keys: list[tuple | None] = []
+        # prefix-cache key per block (tuple chain or sha256 digest)
+        self.block_keys: list[HashKey | None] = []
 
         # Timing (for TTFT / TPOT metrics)
         self.arrival_time = arrival_time if arrival_time is not None else time.perf_counter()
@@ -75,6 +80,13 @@ class Sequence:
 
         # Fork bookkeeping (parallel sampling): id of the parent sequence
         self.parent_seq_id: int | None = None
+
+        # KV capacity reservation (v0.3): how many NOT-yet-materialized
+        # prompt blocks this sequence may still claim. Admission checks and
+        # books the full cold-prompt capacity, but physical blocks are
+        # allocated lazily, per scheduled span. reserved == 0 once the whole
+        # prompt is materialized; preemption releases the reservation.
+        self.reserved_cold_blocks: int = 0
 
         # Per-request RNG (see minivllm/sampling.py): the engine derives a
         # stable 64-bit seed from (engine_seed, request_id, sample_idx,
@@ -131,7 +143,10 @@ class Sequence:
 
     # ---- metrics -----------------------------------------------------------
     def get_ttft(self) -> float:
-        assert self.first_token_time is not None
+        if self.first_token_time is None:
+            # zero-token generations (e.g. a stop string completed by the
+            # very first committed token) have no TTFT
+            return 0.0
         return self.first_token_time - self.arrival_time
 
     def get_tpot(self) -> float:

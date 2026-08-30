@@ -226,16 +226,20 @@ def _params_for(wl: Workload):
 
 def run_mini_vllm_once(model_path, prompts, wl: Workload, device, dtype_str,
                        max_num_seqs, block_size, enable_prefix_caching,
-                       max_in_flight, max_model_len) -> BenchResult:
+                       max_in_flight, max_model_len,
+                       max_num_batched_tokens=0,
+                       enable_chunked_prefill=True,
+                       num_blocks=None) -> BenchResult:
     from minivllm import EngineConfig, LLMEngine
 
     engine = LLMEngine(EngineConfig(
         model=model_path, device=device, dtype=dtype_str,
         block_size=block_size, max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
-        max_num_batched_tokens=max(2048, max_model_len),
+        max_num_batched_tokens=max_num_batched_tokens or max(2048, max_model_len),
         enable_prefix_caching=enable_prefix_caching,
-        enable_chunked_prefill=True))
+        enable_chunked_prefill=enable_chunked_prefill,
+        num_blocks=num_blocks))
     params = _params_for(wl)
     if device == "cuda":
         torch.cuda.synchronize()
@@ -342,17 +346,62 @@ def hf_generate_profiled(model, batch_ids, wl: Workload, device,
     return res
 
 
-def run_hf_once(model_path, prompts, wl: Workload, device, dtype,
-                batch_size, ignore_eos: bool = True) -> BenchResult:
+def run_hf_throughput(model_path, prompts, wl: Workload, device, dtype,
+                      batch_size, ignore_eos: bool = True) -> BenchResult:
+    """THROUGHPUT runner: stock `model.generate`, synchronized only at the
+    timed-region boundaries -- no per-token syncs, so HF's own kernel
+    scheduling is measured as-is. Latency fields stay empty (the latency
+    profiler owns TTFT/TPOT)."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
+    model.to(device).eval()
+    pad_id = model.config.eos_token_id
+    if isinstance(pad_id, list):
+        pad_id = pad_id[0]
+
+    total = 0
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for i in range(0, len(prompts), batch_size):
+        input_ids = torch.tensor(prompts[i:i + batch_size],
+                                 dtype=torch.long, device=device)
+        kwargs = dict(max_new_tokens=wl.output_len, do_sample=wl.temperature > 0,
+                      pad_token_id=pad_id, temperature=wl.temperature,
+                      top_p=wl.top_p)
+        if wl.top_k > 0:
+            kwargs["top_k"] = wl.top_k
+        if ignore_eos:
+            kwargs["eos_token_id"] = None
+        torch.manual_seed(wl.base_seed)     # HF generate has one global RNG
+        out = model.generate(input_ids, **kwargs)
+        total += (out.shape[1] - input_ids.shape[1]) * input_ids.shape[0]
+    if device == "cuda":
+        torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    del model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return BenchResult(
+        "huggingface", wall, len(prompts), total,
+        extra={"batch_size": batch_size,
+               "runner": "model.generate (throughput)"},
+        approximate={"throughput": "stock generate; latency metrics come "
+                                   "from the profiling runner"})
+
+
+def run_hf_latency(model_path, prompts, wl: Workload, device, dtype,
+                   batch_size, ignore_eos: bool = True) -> BenchResult:
+    """LATENCY PROFILER: custom use_cache loop with a sync per step -- real
+    TTFT/TPOT at the cost of inflated wall time. Its throughput must NOT be
+    used for speed comparisons against mini-vllm."""
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
     model.to(device).eval()
 
     ttfts, tpots, e2es, total = [], [], [], 0
-    if device == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
     for i in range(0, len(prompts), batch_size):
         rows = hf_generate_profiled(model, prompts[i:i + batch_size], wl,
                                     device, ignore_eos)
@@ -361,49 +410,57 @@ def run_hf_once(model_path, prompts, wl: Workload, device, dtype,
             tpots.append(tpot)
             e2es.append(e2e)
             total += n
-    if device == "cuda":
-        torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
     del model
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    approximate = {"TTFT/TPOT": "custom use_cache loop, real step timings"}
+    approximate = {"runner": "profiling runner (per-step sync) -- TTFT/TPOT "
+                             "are real; IGNORE its throughput"}
     if batch_size > 1:
         approximate["TTFT"] = (f"approximate: first step shared by batch "
                                f"members (batch={batch_size})")
-    return BenchResult("huggingface", wall, len(prompts), total,
+    return BenchResult("huggingface-latency", 0.0, len(prompts), total,
                        ttfts, tpots, e2es, {"batch_size": batch_size},
                        approximate)
 
 
 # -------------------------------------------------------------------- vLLM
-def run_vllm_once(model_path, prompts, wl: Workload):
-    """Optional baseline: only when vLLM imports and initializes cleanly."""
+def make_vllm_runner(model_path, wl: Workload, prompts, enable_prefix_caching: bool,
+                     max_model_len: int, max_num_seqs: int, block_size: int):
+    """Optional baseline: only when vLLM imports and initializes cleanly.
+    Sampling params mirror the workload (temperature/top_p/top_k/max_tokens/
+    ignore_eos/seed per request); dtype/max_model_len/prefix caching match
+    mini-vllm's config. Returns run_once(prompts) or None."""
     try:
         from vllm import LLM, SamplingParams
-        llm = LLM(model=model_path, max_model_len=4096,
-                  enable_prefix_caching=True, gpu_memory_utilization=0.75)
+        llm = LLM(model=model_path, dtype="float16",
+                  max_model_len=max_model_len, max_num_seqs=max_num_seqs,
+                  block_size=block_size,
+                  enable_prefix_caching=enable_prefix_caching,
+                  gpu_memory_utilization=0.75)
     except Exception as e:                     # not installed / init failure
         print(f"[vllm] unavailable ({type(e).__name__}: {e}) -- skipped")
         return None
     sp = [SamplingParams(temperature=wl.temperature, top_p=wl.top_p,
                          top_k=wl.top_k if wl.top_k > 0 else None,
-                         max_tokens=wl.output_len, ignore_eos=True)
-          for _ in prompts]
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    outs = llm.generate(prompt_token_ids=prompts, sampling_params=sp)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
-    total = sum(len(o.outputs[0].token_ids) for o in outs)
-    del llm
-    torch.cuda.empty_cache()
-    return BenchResult("vllm", wall, len(prompts), total, [], [], [],
-                       {"note": "per-request latency metrics not collected "
-                                "(vLLM baseline is throughput-only)"})
+                         max_tokens=wl.output_len, ignore_eos=True,
+                         seed=wl.base_seed + i)
+          for i in range(len(prompts))]
+
+    def run_once(run_prompts):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outs = llm.generate(prompt_token_ids=run_prompts, sampling_params=sp)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        total = sum(len(o.outputs[0].token_ids) for o in outs)
+        return BenchResult("vllm", wall, len(run_prompts), total, [], [], [],
+                           {"note": "per-request latency metrics not "
+                                    "collected (throughput-only baseline)"})
+
+    return run_once
 
 
 # ------------------------------------------------------------------ drivers
@@ -419,44 +476,64 @@ def compare(args, wl: Workload):
     tok = AutoTokenizer.from_pretrained(args.model)
     prompts = build_token_workload(tok, wl)
     max_model_len = max(wl.input_len + wl.output_len + 64, 1024)
+    budget = args.max_num_batched_tokens or max(2048, max_model_len)
 
     print(f"\n=== workload: {wl.num_prompts} prompts | in~{wl.input_len} "
           f"out={wl.output_len} | shared_prefix={wl.shared_prefix_ratio:.0%} | "
           f"concurrency={wl.concurrency} | greedy="
-          f"{wl.temperature == 0.0} ===")
+          f"{wl.temperature == 0.0} | budget={budget} "
+          f"(chunked prefill {'ON' if budget < max_model_len else 'n/a'}) ===")
 
     results = []
-    # ---- mini-vllm: warmup + measured runs
+    # ---- mini-vllm: warmup N + measured N -> median
     for _ in range(args.warmup):
         run_mini_vllm_once(args.model, prompts, wl, device, dtype_str,
                            args.max_num_seqs, args.block_size,
                            args.enable_prefix_caching, wl.concurrency,
-                           max_model_len)
+                           max_model_len, budget)
     runs = [run_mini_vllm_once(args.model, prompts, wl, device, dtype_str,
                                args.max_num_seqs, args.block_size,
                                args.enable_prefix_caching, wl.concurrency,
-                               max_model_len)
+                               max_model_len, budget)
             for _ in range(args.runs)]
     mini = merge_runs(runs, "mini-vllm")
     print_result(mini)
     results.append(mini)
 
-    # ---- HuggingFace
-    for _ in range(max(1, args.warmup // 2)):
-        run_hf_once(args.model, prompts[:min(len(prompts), args.hf_batch_size)],
-                    wl, device, dtype, args.hf_batch_size)
-    hf = run_hf_once(args.model, prompts, wl, device, dtype, args.hf_batch_size)
+    # ---- HuggingFace throughput: SAME warmup N + measured N -> median
+    # (stock generate, no per-token syncs)
+    for _ in range(args.warmup):
+        run_hf_throughput(args.model, prompts[:args.hf_batch_size], wl, device,
+                          dtype, args.hf_batch_size)
+    hf_runs = [run_hf_throughput(args.model, prompts, wl, device, dtype,
+                                 args.hf_batch_size)
+               for _ in range(args.runs)]
+    hf = merge_runs(hf_runs, "huggingface")
     print_result(hf)
     results.append(hf)
 
+    # ---- HuggingFace latency profiler: ONE run, never used for throughput
+    hf_lat = run_hf_latency(args.model, prompts, wl, device, dtype,
+                            args.hf_batch_size)
+    print_result(hf_lat)
+    results.append(hf_lat)
+
+    # ---- vLLM baseline: SAME warmup N + measured N -> median
     if device == "cuda" and not args.no_vllm:
-        v = run_vllm_once(args.model, prompts, wl)
-        if v is not None:
+        runner = make_vllm_runner(args.model, wl, prompts,
+                                  args.enable_prefix_caching, max_model_len,
+                                  args.max_num_seqs, args.block_size)
+        if runner is not None:
+            for _ in range(args.warmup):
+                runner(prompts)
+            v = merge_runs([runner(prompts) for _ in range(args.runs)], "vllm")
             print_result(v)
             results.append(v)
 
     base = results[0]
     for other in results[1:]:
+        if other.engine == "huggingface-latency" or other.throughput <= 0:
+            continue
         print(f"\n==> mini-vllm throughput vs {other.engine}: "
               f"{base.throughput / other.throughput:.2f}x")
     return results
@@ -554,59 +631,141 @@ def bench_speculative(args):
 
 
 def bench_sampling(args):
-    """Sampling microbenchmark: per-sequence sync style vs batched sampler."""
-    from minivllm.sampling import sample_from_logits, sample_tokens
+    """Sampling microbenchmark: three implementations.
+
+      per-seq   : sample_from_logits per sequence (B syncs/step)   [v0.1]
+      cpu-probs : one D2H of the [B, V] probability matrix         [v0.2]
+      gpu-native: [B] uniforms H2D + inverse CDF + [B] ids D2H     [v0.3]
+
+    Reports latency, estimated cross-device bytes per step, and speedup.
+    The v0.2->v0.3 story is bandwidth, not just time:
+        v0.2: O(B*V) D2H  (B=64, V=150k, fp32 -> ~38 MB / step)
+        v0.3: O(B) H2D + O(B) D2H (~0.8 KB / step)
+    """
+    from minivllm.sampling import (
+        probs_batch_from_logits,
+        sample_from_logits,
+        sample_tokens,
+    )
     from minivllm.sequence import SamplingParams, Sequence
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"sampling microbenchmark on {device}: per-seq .item() syncs vs "
-          f"batched sampler (<=1 sync per group)")
+    print(f"sampling microbenchmark on {device} (best of 20)")
+    print(f"{'B':>4} {'vocab':>7} {'per-seq ms':>11} {'cpu-probs ms':>13} "
+          f"{'gpu-native ms':>14} {'D2H KiB old->new':>18} {'speedup':>8}")
 
-    class S(Sequence):
-        pass
-
-    for B in (1, 4, 16, 32, 64):
-        torch.manual_seed(0)
-        logits = torch.randn(B, 32000, device=device)
+    def make_seqs(B, seed0=1000):
         seqs = []
         for i in range(B):
             p = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=1)
             s = Sequence([1], p)
-            s.rng_seed = 1000 + i
+            s.rng_seed = seed0 + i
             seqs.append(s)
+        return seqs
 
-        # old style: per-sequence sample_from_logits (1 D2H each)
-        def old_style(B=B, logits=logits, seqs=seqs):
-            for i in range(B):
-                sample_from_logits(logits[i], 0.7, -1, 0.9,
-                                   generator=seqs[i].sampling_generator())
+    for vocab in (32_000, 64_000, 150_000):
+        for B in (1, 4, 16, 32, 64, 128):
+            torch.manual_seed(0)
+            logits = torch.randn(B, vocab, device=device)
+            seqs = make_seqs(B)
 
-        def new_style(logits=logits, seqs=seqs):
-            sample_tokens(logits, seqs)
+            def per_seq(B=B, logits=logits, seqs=seqs):
+                for i in range(B):
+                    sample_from_logits(logits[i], 0.7, -1, 0.9,
+                                       generator=seqs[i].sampling_generator())
 
-        def bench(fn, reps=20):
-            for _ in range(3):
-                fn()
-            if device == "cuda":
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(reps):
-                fn()
-            if device == "cuda":
-                torch.cuda.synchronize()
-            return (time.perf_counter() - t0) / reps * 1000
+            def cpu_probs(B=B, logits=logits, seqs=seqs):
+                # v0.2 path: batched filter+softmax, then the whole
+                # [B, V] probability matrix crosses to the CPU
+                probs = probs_batch_from_logits(logits, 0.7, -1, 0.9).float()
+                probs_cpu = probs.cpu()
+                for row in range(B):
+                    torch.multinomial(probs_cpu[row], 1,
+                                      generator=seqs[row].sampling_generator())
 
-        t_old = bench(old_style)
-        t_new = bench(new_style)
-        print(f"  B={B:>3}: per-seq {t_old:7.2f} ms | batched {t_new:6.2f} ms "
-              f"| speedup {t_old / t_new:.1f}x")
+            def gpu_native(logits=logits, seqs=seqs):
+                sample_tokens(logits, seqs)
+
+            def bench(fn, reps=20):
+                for _ in range(3):
+                    fn()
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(reps):
+                    fn()
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                return (time.perf_counter() - t0) / reps * 1000
+
+            t1, t2, t3 = bench(per_seq), bench(cpu_probs), bench(gpu_native)
+            old_kib = B * vocab * 4 / 1024               # fp32 probs D2H
+            new_kib = (B * 4 + B * 8) / 1024             # uniforms H2D + ids D2H
+            print(f"{B:>4} {vocab:>7} {t1:>11.2f} {t2:>13.2f} {t3:>14.2f} "
+                  f"{old_kib:>10.0f}->{new_kib:>5.1f} {t2 / t3:>7.1f}x")
 
 
 # --------------------------------------------------------------------- CLI
+# -------------------------------------------------------- scheduler bench
+def bench_scheduler(args):
+    """Scheduler-focused workloads (mini-vllm only), each run with chunked
+    prefill ON and OFF:
+
+      A decode-heavy      : many short prompts, long outputs
+      B long-prefill+mix  : long prompts staggered behind running decodes
+      C prefix-cache hit  : 90% shared prefix, cache ON
+      D KV pressure       : small pool -> preemption / recompute
+    """
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtype_str = prepare_dtype_str(device)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model)
+    max_model_len = 8192
+
+    scenarios = {
+        "A-decode-heavy": Workload(32, 128, 128, 0.0, args.seed,
+                                   concurrency=32),
+        "B-long-prefill-mix": Workload(8, 4096, 64, 0.0, args.seed,
+                                       concurrency=8),
+        "C-prefix-cache-hit": Workload(32, 256, 32, 0.9, args.seed,
+                                       concurrency=16),
+        "D-kv-pressure": Workload(16, 512, 64, 0.0, args.seed,
+                                  concurrency=16),
+    }
+    budget = args.max_num_batched_tokens or 1024
+    pressure_blocks = 512 if device == "cuda" else 512   # small on purpose
+
+    json_out = {"model": args.model, "mode": "scheduler", "scenarios": {}}
+    for name, wl in scenarios.items():
+        for chunked in (True, False):
+            num_blocks = pressure_blocks if name.startswith("D") else None
+            tag = f"{name}{'/chunked' if chunked else '/whole'}"
+            print(f"\n=== scheduler scenario {tag} | budget={budget} ===")
+            prompts = build_token_workload(tok, wl)
+            for _ in range(args.warmup):
+                run_mini_vllm_once(args.model, prompts, wl, device, dtype_str,
+                                   args.max_num_seqs, args.block_size, True,
+                                   wl.concurrency, max_model_len, budget,
+                                   chunked, num_blocks)
+            runs = [run_mini_vllm_once(args.model, prompts, wl, device,
+                                       dtype_str, args.max_num_seqs,
+                                       args.block_size, True, wl.concurrency,
+                                       max_model_len, budget, chunked,
+                                       num_blocks)
+                    for _ in range(args.runs)]
+            r = merge_runs(runs, f"mini-vllm[{tag}]")
+            print_result(r)
+            jr = result_to_json(r, wl, args.model, device, dtype_str)
+            jr["scenario"] = name
+            jr["chunked_prefill"] = chunked
+            json_out["scenarios"].setdefault(name, []).append(jr)
+    return json_out
+
+
 def main():
     ap = argparse.ArgumentParser(description="mini-vllm benchmark")
-    ap.add_argument("--mode", choices=["compare", "spec", "sampling"],
-                    default="compare")
+    ap.add_argument("--mode", choices=["compare", "spec", "sampling",
+                                       "scheduler"], default="compare")
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--num-prompts", type=int, default=16)
     ap.add_argument("--input-len", type=int, default=128,
@@ -621,6 +780,11 @@ def main():
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=-1)
     ap.add_argument("--max-num-seqs", type=int, default=16)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=0,
+                    help="token budget per step (0 = auto: max(2048, "
+                         "max_model_len)). Set BELOW input_len to actually "
+                         "exercise chunked prefill, e.g. --input-len 2048 "
+                         "--max-num-batched-tokens 256")
     ap.add_argument("--block-size", type=int, default=16)
     ap.add_argument("--hf-batch-size", type=int, default=1)
     ap.add_argument("--enable-prefix-caching", action="store_true")
@@ -647,6 +811,14 @@ def main():
 
     if args.mode == "spec":
         bench_speculative(args)
+        return
+
+    if args.mode == "scheduler":
+        json_out = bench_scheduler(args)
+        if args.output and json_out:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(json_out, f, indent=2, ensure_ascii=False)
+            print(f"\nresults written to {args.output}")
         return
 
     json_out = {"model": args.model, "results": []}

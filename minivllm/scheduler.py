@@ -13,6 +13,10 @@ order:
      ``min(remaining_work, remaining_budget)`` tokens. A long prompt is
      therefore spread over several iterations and can never block decodes
      for more than one iteration (head-of-line blocking is gone).
+     With ``enable_chunked_prefill=False`` the legacy semantics hold: a
+     waiting prompt is admitted only if its WHOLE uncached remainder fits
+     the budget (no partial prompt prefill; mid-prefill running sequences
+     cannot exist in that mode).
 
 Prefix-cache-aware admission (the budget fix): for a waiting sequence we
 first ask the block manager -- read-only, no refcount changes -- how many of
@@ -53,10 +57,22 @@ class SchedulerOutput:
 
 class Scheduler:
     def __init__(self, block_manager: BlockSpaceManager, max_num_seqs: int,
-                 max_num_batched_tokens: int):
+                 max_num_batched_tokens: int,
+                 enable_chunked_prefill: bool = True,
+                 reserve_full_isl: bool = True,
+                 lazy_allocation: bool = True):
         self.bm = block_manager
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.enable_chunked_prefill = enable_chunked_prefill
+        # Reservation policy: True = admission checks and books the whole
+        # cold-prompt capacity (conservative, no over-admission); False =
+        # only the first chunk's blocks are checked (aggressive admission,
+        # more preemptions possible). Physical allocation policy: lazy =
+        # blocks materialize per scheduled span; eager = the whole prompt
+        # materializes at admission (v0.2 behavior, kept for A/B tests).
+        self.reserve_full_isl = reserve_full_isl
+        self.lazy_allocation = lazy_allocation
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self.num_preemptions = 0
@@ -95,7 +111,7 @@ class Scheduler:
             assert need >= 1, f"seq {seq.seq_id} has no new tokens to run"
             if need > budget:
                 break                    # budget fully consumed by decodes
-            if not self.bm.prepare_slots(seq):
+            if not self.bm.allocate_span(seq):
                 victim = self._preempt_newest(out)
                 if victim is seq:
                     continue             # seq left the list; do not advance
@@ -107,7 +123,10 @@ class Scheduler:
             budget -= need
             i += 1
 
-        # ---- 2. prefill chunks of running sequences (FCFS)
+        # ---- 2. prefill chunks of running sequences (FCFS).
+        # With chunked prefill disabled, mid-prefill running sequences
+        # cannot exist: admission below only accepts prompts that fit the
+        # budget whole (invariant asserted at admission).
         i = 0
         while i < len(self.running) and budget > 0:
             seq = self.running[i]
@@ -115,8 +134,10 @@ class Scheduler:
                 i += 1
                 continue
             start = seq.num_computed_tokens
-            end = min(seq.num_tokens, start + budget)
-            if not self.bm.prepare_slots(seq, start, end):
+            end = seq.num_tokens if not self.enable_chunked_prefill \
+                else min(seq.num_tokens, start + budget)
+            assert end - start <= budget or self.enable_chunked_prefill
+            if not self.bm.allocate_span(seq, start, end):
                 victim = self._preempt_newest(out)
                 if victim is seq:
                     continue             # re-examine running[i] (new seq now)
@@ -142,7 +163,7 @@ class Scheduler:
                 chunk = min(seq.num_tokens - start, budget)
                 if chunk < 1:
                     break
-                if not self.bm.prepare_slots(seq, start, start + chunk):
+                if not self.bm.allocate_span(seq, start, start + chunk):
                     break
             else:
                 # 3a. read-only prefix-cache probe: how many prompt tokens
@@ -154,22 +175,58 @@ class Scheduler:
                 # once, so the forward produces logits (rewritten KV
                 # identical to what the shared block already holds).
 
-                # 3b. budget check BEFORE acquiring any block
-                chunk = min(seq.num_tokens - start, budget)
+                # 3b. budget check BEFORE acquiring any block. With chunked
+                # prefill disabled, the WHOLE remaining prompt must fit the
+                # budget -- otherwise the request stays WAITING (no partial
+                # prompt prefill, ever).
+                remaining = seq.num_tokens - start
+                if not self.enable_chunked_prefill and remaining > budget:
+                    break
+                chunk = min(remaining, budget)
                 if chunk < 1:
                     break
 
-                # 3c. acquire KV blocks (allocation failure rolls back
-                # inside the block manager; FCFS stops here)
-                cached = self.bm.allocate_sequence(seq)
-                if cached is None:
-                    break                # out of blocks, FCFS stop
-                # single-threaded scheduler: `cached` equals the probe
-                # above; re-derive start defensively anyway.
-                start = min(cached, seq.num_tokens - 1)
-                chunk = min(seq.num_tokens - start, budget)
+                # 3c. KV CAPACITY RESERVATION != ALLOCATION. The cold-prompt
+                # capacity (cache hits excluded) is checked -- and, under
+                # reserve_full_isl, booked for the whole prompt -- before
+                # any block is taken. Physical blocks materialize lazily,
+                # one scheduled span at a time (eager mode kept for A/B
+                # benchmarking).
+                cold = self.bm.cold_blocks_needed(seq.num_tokens, cached_len)
+                available = self.bm.blocks_available_after_mapping(cached_len)
+                need_now = (start + chunk + self.bm.block_size - 1)                     // self.bm.block_size - cached_len // self.bm.block_size
+                if self.reserve_full_isl:
+                    # promise the whole prompt capacity, checked upfront
+                    if cold > available:
+                        break            # would over-admit: FCFS stop
+                    booked = cold
+                else:
+                    # aggressive: only the first chunk is checked and booked;
+                    # later spans proceed unchecked (preemption is the net)
+                    if need_now > available:
+                        break
+                    booked = need_now
 
-            seq.num_computed_tokens = start
+                if self.lazy_allocation:
+                    self.bm.map_cached_prefix(seq)
+                    # single-threaded scheduler: the mapping equals the
+                    # probe above
+                    self.bm.reserve(seq, booked)
+                    if not self.bm.allocate_span(seq, start, start + chunk):
+                        # first chunk does not fit: undo mapping + reservation
+                        self.bm.release_reservation(seq)
+                        self.bm.free_sequence(seq)
+                        break
+                else:
+                    cached = self.bm.allocate_sequence(seq)   # eager path
+                    if cached is None:
+                        break
+                    start = min(cached, seq.num_tokens - 1)
+                    chunk = min(seq.num_tokens - start, budget)
+                    seq.num_computed_tokens = start
+
+            if self.lazy_allocation:
+                seq.num_computed_tokens = start
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)

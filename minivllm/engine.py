@@ -89,7 +89,17 @@ class LLMEngine:
             hash_backend=make_hash_backend(config.hash_backend),
             hash_metadata=f"model={config.model}")
         self.scheduler = Scheduler(self.block_manager, config.max_num_seqs,
-                                   config.max_num_batched_tokens)
+                                   config.max_num_batched_tokens,
+                                   enable_chunked_prefill=config.enable_chunked_prefill,
+                                   reserve_full_isl=config.scheduler_reserve_full_isl,
+                                   lazy_allocation=config.lazy_block_allocation)
+
+        # v0.3 runtime-overhead state: persistent (pinned staging, device)
+        # metadata buffer pairs, grown on demand and keyed by tensor kind;
+        # plus optional per-phase step timing (set `step_timings` to a dict
+        # to profile; None = zero overhead)
+        self.step_timings: dict | None = None
+        self._buffers: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.groups: dict[int, RequestGroup] = {}
         self.seq_to_group: dict[int, RequestGroup] = {}
@@ -111,7 +121,8 @@ class LLMEngine:
         gen_eos = getattr(hf.generation_config, "eos_token_id", None)
         self._gen_eos_ids = set(gen_eos if isinstance(gen_eos, list) else
                                 ([gen_eos] if gen_eos is not None else []))
-        model = Qwen2ForCausalLM(cfg, self.device, self.dtype)
+        model = Qwen2ForCausalLM(cfg, self.device, self.dtype,
+                                 attention_backend=self.config.attention_backend)
         model.load_from_hf(hf)
         del hf
         model.to(self.device)
@@ -181,22 +192,21 @@ class LLMEngine:
     @torch.no_grad()
     def step(self) -> list[RequestOutput]:
         """One engine iteration. Returns requests that finished in this step."""
+        prof = self.step_timings              # None unless profiling (below)
+        t0 = time.perf_counter() if prof is not None else 0.0
         sched = self.scheduler.schedule()
         if not sched.scheduled:
             return []
+        t1 = time.perf_counter() if prof is not None else 0.0
 
         # ---- build the flat varlen batch from per-sequence token spans
         device = self.device
-        input_ids, positions, seq_inputs, logit_idx = [], [], [], []
+        input_ids, positions, logit_idx = [], [], []
         sample_entries = []              # (scheduled index, sequence) that sample
         t = 0
         for si, (seq, (start, end)) in enumerate(zip(sched.scheduled, sched.spans)):
             input_ids.extend(seq.tokens[start:end])
             positions.extend(range(start, end))
-            seq_inputs.append(SeqInput(
-                q_start=start, q_len=end - start,
-                block_table=torch.tensor(seq.block_table, dtype=torch.long, device=device),
-                t0=t))
             if end >= seq.num_prompt_tokens:
                 # this forward completes the prompt (or is a decode step), so
                 # its last position yields the next-token logits. A mid-prefill
@@ -204,16 +214,34 @@ class LLMEngine:
                 logit_idx.append(t + (end - start) - 1)
                 sample_entries.append((si, seq))
             t += end - start
+        # persistent metadata (v0.3): each tensor goes through a pinned-CPU
+        # staging fill + ONE non-blocking H2D copy -- the hot path allocates
+        # no fresh device tensors. Block-table row views feed the model.
+        tables_t = self._upload_tables([s.block_table
+                                        for s in sched.scheduled])
+        ids_t = self._upload_1d(input_ids, "ids")
+        pos_t = self._upload_1d(positions, "pos")
+        logits_t = self._upload_1d(logit_idx, "logits")
+        seq_inputs = []
+        t = 0
+        for si, (seq, (start, end)) in enumerate(zip(sched.scheduled,
+                                                     sched.spans)):
+            seq_inputs.append(SeqInput(
+                q_start=start, q_len=end - start,
+                block_table=tables_t[si, :len(seq.block_table)], t0=t))
+            t += end - start
+        t2 = time.perf_counter() if prof is not None else 0.0
 
-        logits = self.model(
-            torch.tensor(input_ids, dtype=torch.long, device=device),
-            torch.tensor(positions, dtype=torch.long, device=device),
-            self.block_manager.pool, seq_inputs,
-            torch.tensor(logit_idx, dtype=torch.long, device=device))
+        logits = self.model(ids_t, pos_t, self.block_manager.pool, seq_inputs,
+                            logits_t)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t3 = time.perf_counter() if prof is not None else 0.0
 
         # ---- batched sampling: <=1 GPU->CPU sync per sampling-config group
         new_tokens = sample_tokens(
             logits, [seq for _, seq in sample_entries])
+        t4 = time.perf_counter() if prof is not None else 0.0
 
         finished: list[RequestOutput] = []
         now = time.perf_counter()
@@ -254,7 +282,51 @@ class LLMEngine:
                 out = self._build_output(seq)
                 if out is not None:
                     finished.append(out)
+        if prof is not None:
+            t5 = time.perf_counter()
+            for key, dt in (("schedule", t1 - t0), ("metadata", t2 - t1),
+                            ("forward", t3 - t2), ("sampling", t4 - t3),
+                            ("bookkeeping", t5 - t4)):
+                prof[key] = prof.get(key, 0.0) + dt
+            prof["steps"] = prof.get("steps", 0) + 1
         return finished
+
+    # --------------------------------------------------- profiling support
+    def _buffer_pair(self, kind: str, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Persistent (pinned staging, device) buffer pair for one metadata
+        tensor kind -- separate pairs never alias each other."""
+        pair = self._buffers.get(kind)
+        if pair is None or pair[0].numel() < n:
+            size = max(n, 4096)
+            pair = (torch.empty(size, dtype=torch.long,
+                                pin_memory=self.device == "cuda"),
+                    torch.empty(size, dtype=torch.long, device=self.device))
+            self._buffers[kind] = pair
+        return pair
+
+    def _upload_1d(self, values: list[int], kind: str) -> torch.Tensor:
+        """values -> device int64 tensor: pinned staging fill + ONE
+        non-blocking H2D copy; no fresh device allocation in the hot path."""
+        n = len(values)
+        st, dev = self._buffer_pair(kind, n)
+        st[:n].copy_(torch.tensor(values, dtype=torch.long))
+        dev[:n].copy_(st[:n], non_blocking=True)
+        return dev[:n]
+
+    def _upload_tables(self, block_tables: list[list[int]]) -> torch.Tensor:
+        """Per-sequence block tables -> one persistent [S, max_nb] device
+        tensor; the model consumes row views."""
+        S = len(block_tables)
+        max_nb = max((len(t) for t in block_tables), default=1)
+        st, dev = self._buffer_pair("tables2d", S * max_nb)
+        st2d = st[:S * max_nb].view(S, max_nb)
+        dev2d = dev[:S * max_nb].view(S, max_nb)
+        for i, table in enumerate(block_tables):
+            st2d[i, :len(table)] = torch.tensor(table, dtype=torch.long)
+        dev2d.copy_(st2d, non_blocking=True)
+        return dev2d
+
+
 
     def _maybe_fork_children(self, seq: Sequence):
         group = self._group_of(seq)
@@ -358,4 +430,6 @@ class LLMEngine:
             "evictable_blocks": bm.num_evictable_blocks(),
             "peak_blocks": bm.alloc_watermark,
             "kv_utilization": round(bm.num_used_blocks() / bm.num_blocks, 4),
+            "reserved_blocks": sum(s.reserved_cold_blocks
+                                   for s in self.scheduler.running),
         }
