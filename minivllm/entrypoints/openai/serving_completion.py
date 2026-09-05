@@ -258,6 +258,10 @@ async def _delta_sse(ctx, req, ext_rid, created, kind):
         e2e = time.perf_counter() - start
         ctx.metrics.observe("request_e2e_seconds", e2e)
         ctx.metrics.inc("generation_tokens_total", n_tokens)
+        # the async-engine registry entry dies with the stream: without
+        # this, finished streams leak one entry each and eventually the
+        # admission cap 429s every new request
+        ctx.engine.requests.pop(ext_rid, None)
         if not finished_cleanly:
             # client disconnected / generator cancelled: stop the GPU
             await ctx.engine.abort_request(ext_rid)

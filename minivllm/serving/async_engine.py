@@ -310,6 +310,7 @@ class AsyncLLMEngine:
         except asyncio.QueueFull:
             self._slow_client_cancellations += 1
             rid = req.request_id
+            self.requests.pop(rid, None)     # nobody will consume this
             self._cmd_queue.put(_EngineCommand(kind="abort",
                                                target_request_id=rid))
             self._wake.set()

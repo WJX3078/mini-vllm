@@ -220,6 +220,8 @@ def test_concurrent_streaming_no_cross_talk():
         results = await asyncio.gather(*[one(i) for i in range(16)])
         assert len(results) == 16
         assert len({i for i, _ in results}) == 16
+        await asyncio.sleep(0.1)
+        assert len(engine.requests) == 0     # registry: no stream leaks
     with_server(fn)
 
 
@@ -241,8 +243,6 @@ def test_client_disconnect_aborts_generation():
     """Abandoning a streaming response must abort the engine request (the
     GPU stops) and leave no leaks."""
     async def fn(client, engine):
-        rid_holder = {}
-
         async def open_and_abandon():
             async with client.stream("POST", "/v1/completions", json={
                     "prompt": "D" * 20, "max_tokens": 128,
