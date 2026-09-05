@@ -35,6 +35,28 @@ from minivllm.scheduler import Scheduler
 from minivllm.sequence import RequestOutput, SamplingParams, Sequence, SequenceStatus
 from minivllm.stopping import StopChecker
 
+_FINISH_REASONS = {
+    SequenceStatus.FINISHED_STOPPED: "stop",
+    SequenceStatus.FINISHED_LENGTH: "length",
+    SequenceStatus.FINISHED_ABORTED: "abort",
+}
+
+
+@dataclass
+class RequestOutputDelta:
+    """Per-request incremental output produced by every `step()`.
+
+    `token_ids` holds the tokens newly generated THIS step for one
+    sequence of the request (`sample_idx` distinguishes parallel-sampling
+    children). `finish_reason` is set on the final delta:
+    "stop" | "length" | "abort"."""
+
+    request_id: int
+    sample_idx: int
+    token_ids: list[int]
+    finished: bool = False
+    finish_reason: str | None = None
+
 
 @dataclass
 class RequestGroup:
@@ -44,6 +66,17 @@ class RequestGroup:
     main: Sequence
     pending_forks: list[Sequence] = field(default_factory=list)
     stop_checker: StopChecker | None = None
+    # all sequences of this request (children appended when forked) and how
+    # many are not finished yet -- the group leaves the registry only when
+    # the counter hits zero (v0.4: long-serving registry leak fix)
+    seq_ids: list[int] = field(default_factory=list)
+    children: list[Sequence] = field(default_factory=list)
+    active_seqs: int = 0
+
+    def register(self):
+        self.active_seqs = 1 + len(self.pending_forks)
+        self.seq_ids = [self.main.seq_id] + [c.seq_id
+                                             for c in self.pending_forks]
 
 
 class LLMEngine:
@@ -100,6 +133,8 @@ class LLMEngine:
         # to profile; None = zero overhead)
         self.step_timings: dict | None = None
         self._buffers: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # v0.4: per-step incremental outputs, consumed via pop_deltas()
+        self._deltas: list[RequestOutputDelta] = []
 
         self.groups: dict[int, RequestGroup] = {}
         self.seq_to_group: dict[int, RequestGroup] = {}
@@ -164,11 +199,69 @@ class LLMEngine:
                            engine_seed=self.config.seed)
             group.pending_forks.append(child)
         self.groups[request_id] = group
+        group.register()
         self.seq_to_group[main.seq_id] = group
         for child in group.pending_forks:
             self.seq_to_group[child.seq_id] = group
         self.scheduler.add(main)
         return request_id
+
+    # ------------------------------------------------- v0.4: abort + deltas
+    def pop_deltas(self) -> list[RequestOutputDelta]:
+        """Incremental outputs produced by the last `step()` (one delta per
+        sampled sequence; finished sequences carry their finish_reason)."""
+        deltas, self._deltas = self._deltas, []
+        return deltas
+
+    def abort_request(self, request_id: int) -> bool:
+        """Cancel a request wherever it is (waiting / running / mid-fork).
+
+        Idempotent: unknown or already-finished ids return False and change
+        nothing. Releases every owned KV block and reservation, decrements
+        shared prefix refcounts, and drops the group from the registry once
+        all of its sequences are done. Emits a final "abort" delta."""
+        group = self.groups.get(request_id)
+        if group is None:
+            return False
+
+        # 1. pending forks still sit in the waiting queue (block-free)
+        for child in list(group.pending_forks):
+            try:
+                self.scheduler.waiting.remove(child)
+            except ValueError:
+                pass                      # already scheduled/finished
+            child.status = SequenceStatus.FINISHED_ABORTED
+            group.active_seqs = max(0, group.active_seqs - 1)
+        group.pending_forks = []
+
+        # 2. main + forked children: wherever they are, release everything
+        for seq in [group.main, *group.children]:
+            if seq.is_finished:
+                continue
+            if seq in self.scheduler.running:
+                self.scheduler.running.remove(seq)
+            try:
+                self.scheduler.waiting.remove(seq)
+            except ValueError:
+                pass
+            # releases blocks, shared refcounts and any reservation
+            self.block_manager.free_sequence(seq)
+            seq.status = SequenceStatus.FINISHED_ABORTED
+            self._deltas.append(RequestOutputDelta(
+                request_id, seq.sample_idx, [], finished=True,
+                finish_reason="abort"))
+            self._release_seq_from_group(group, seq)
+        return True
+
+    def _release_seq_from_group(self, group: RequestGroup, seq: Sequence):
+        """Book one sequence as done; drop the whole group from the
+        registry when its last sequence finishes (no leaks in long
+        serving)."""
+        group.active_seqs = max(0, group.active_seqs - 1)
+        if group.active_seqs == 0:
+            self.groups.pop(group.request_id, None)
+            for sid in group.seq_ids:
+                self.seq_to_group.pop(sid, None)
 
     @staticmethod
     def _seed_rng(seq: Sequence, request_id: int, sample_idx: int,
@@ -282,6 +375,16 @@ class LLMEngine:
                 out = self._build_output(seq)
                 if out is not None:
                     finished.append(out)
+            # v0.4: incremental delta for the serving layer
+            if group is not None:
+                self._deltas.append(RequestOutputDelta(
+                    request_id=group.request_id,
+                    sample_idx=seq.sample_idx,
+                    token_ids=[token],
+                    finished=done_reason is not None,
+                    finish_reason=_FINISH_REASONS.get(done_reason)))
+                if done_reason is not None:
+                    self._release_seq_from_group(group, seq)
         if prof is not None:
             t5 = time.perf_counter()
             for key, dt in (("schedule", t1 - t0), ("metadata", t2 - t1),
@@ -289,6 +392,11 @@ class LLMEngine:
                             ("bookkeeping", t5 - t4)):
                 prof[key] = prof.get(key, 0.0) + dt
             prof["steps"] = prof.get("steps", 0) + 1
+        # keep the running list truthful for serving gauges: finished
+        # sequences leave immediately instead of lingering until the next
+        # schedule() call
+        self.scheduler.running = [s for s in self.scheduler.running
+                                  if not s.is_finished]
         return finished
 
     # --------------------------------------------------- profiling support
@@ -340,6 +448,7 @@ class LLMEngine:
             child.num_computed_tokens = seq.num_computed_tokens
             child.arrival_time = seq.arrival_time
             child.first_token_time = seq.first_token_time
+            group.children.append(child)
             self.scheduler.add(child)
         group.pending_forks = []
 
@@ -413,6 +522,7 @@ class LLMEngine:
                 else:                       # merge parallel-sampling children
                     prev.outputs.extend(out.outputs)
                 bar.update(1)
+            self.pop_deltas()               # sync path ignores deltas
         bar.close()
         return [results[i] for i in sorted(results)]
 

@@ -195,27 +195,24 @@ def test_mixed_chunked_batch_single_iteration():
     eng, hf = _make(chunked=True, budget=96)
     long_prompt = [i % 250 for i in range(300)]
     short = random_prompts(1, min_len=10, max_len=10, seed=57)[0]
-    rid_short = eng.add_request(short, SamplingParams(
-        temperature=0.0, max_tokens=3, ignore_eos=True))
-    while len(eng.groups[rid_short].main.output_token_ids) < 1:
+    short_seq = eng.groups[eng.add_request(short, SamplingParams(
+        temperature=0.0, max_tokens=3, ignore_eos=True))].main
+    while len(short_seq.output_token_ids) < 1:
         eng.step()                                 # short is decoding now
-    rid_long = eng.add_request(long_prompt, SamplingParams(
-        temperature=0.0, max_tokens=3, ignore_eos=True))
+    long_seq = eng.groups[eng.add_request(long_prompt, SamplingParams(
+        temperature=0.0, max_tokens=3, ignore_eos=True))].main
     iters = _spy_spans_per_iter(eng)
-    while not (eng.groups[rid_short].main.is_finished
-               and eng.groups[rid_long].main.is_finished):
+    while not (short_seq.is_finished and long_seq.is_finished):
         eng.step()
     mixed = [it for it in iters
              if any(pl == 10 and st >= 10 for pl, st, e in it)
              and any(pl == 300 and st < 300 for pl, st, e in it)]
     assert mixed, "no iteration mixed a decode step with a prefill chunk"
 
-    lm = eng.groups[rid_long].main
-    ss = eng.groups[rid_short].main
-    assert lm.output_token_ids == run_hf_greedy(hf, [long_prompt],
-                                                max_new_tokens=3)[0]
-    assert ss.output_token_ids == run_hf_greedy(hf, [short],
-                                                max_new_tokens=3)[0]
+    assert long_seq.output_token_ids == run_hf_greedy(hf, [long_prompt],
+                                                       max_new_tokens=3)[0]
+    assert short_seq.output_token_ids == run_hf_greedy(hf, [short],
+                                                       max_new_tokens=3)[0]
 
 
 def test_chunked_prefill_never_breaks_block_accounting():
