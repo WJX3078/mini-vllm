@@ -26,7 +26,7 @@ def test_abort_waiting_request(engine_factory):
     """A long prompt behind a running one must be cancellable while it is
     still WAITING: no blocks were materialized, nothing else is affected."""
     eng = engine_factory(num_blocks=13)
-    first = eng.add_request(ids_for("short"), SamplingParams(
+    eng.add_request(ids_for("short"), SamplingParams(
         max_tokens=6, ignore_eos=True))
     long_prompt = ids_for("L" * 100)
     second = eng.add_request(long_prompt, SamplingParams(
@@ -52,7 +52,6 @@ def test_abort_running_request_releases_blocks(engine_factory):
     rid = eng.add_request(prompt, SamplingParams(max_tokens=32,
                                                  ignore_eos=True))
     _drive(eng, 3)                                   # running, blocks held
-    rid_seq = None
     held = sum(len(s.block_table) for s in eng.scheduler.running)
     assert held >= 1
 

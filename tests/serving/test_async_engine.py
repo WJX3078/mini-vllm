@@ -87,7 +87,7 @@ def test_async_multi_request_and_output_routing():
                 return mark, outs
 
             results = await asyncio.gather(*[one(m) for m in marks])
-            for mark, outs in results:
+            for _, outs in results:
                 tokens = [t for d in outs for t in d["token_ids"]]
                 assert tokens, "no tokens streamed"
                 assert outs[-1]["finish_reason"] == "length"
@@ -147,7 +147,7 @@ def test_no_request_lost_or_duplicated():
 
             async def one(i):
                 count = 0
-                async for d in a.generate(ids_for(f"u{i}"),
+                async for _ in a.generate(ids_for(f"u{i}"),
                                           SamplingParams(
                                               max_tokens=4, ignore_eos=True,
                                               seed=100 + i)):

@@ -23,7 +23,12 @@ class ByteTokenizer:
         self.pad_token_id = 0
 
     def __call__(self, text):
-        return {"input_ids": self.encode(text)}
+        # HF convention: return an object carrying input_ids
+        class _Enc:
+            pass
+        e = _Enc()
+        e.input_ids = self.encode(text)
+        return e
 
     def encode(self, text, add_special_tokens=False):
         return list(text.encode("utf-8"))
@@ -35,11 +40,6 @@ class ByteTokenizer:
                             add_generation_prompt=True):
         text = "".join(f"{m['role']}: {m['content']}\n" for m in messages)
         return text if not tokenize else self(text).input_ids
-
-
-def ids_for(text: str) -> list[int]:
-    """Token ids for a string under the ByteTokenizer."""
-    return list(text.encode("utf-8"))
 
 
 @pytest.fixture
