@@ -176,17 +176,22 @@ async def run_closed_loop(client, base_url, model, prompts, concurrency,
 
 
 async def run_open_loop(client, base_url, model, prompts, request_rate,
-                        timeout):
+                        timeout, seed=0):
+    args_seed_holder = [seed]
     stats = [RequestStat() for _ in prompts]
     start = time.perf_counter()
+
+    rng = random.Random(args_seed_holder[0])
 
     async def one(i, delay):
         await asyncio.sleep(delay)
         await stream_one(client, base_url, model, prompts[i], stats[i],
                          timeout)
 
-    await asyncio.gather(*[one(i, i / request_rate)
-                           for i in range(len(prompts))])
+    # Poisson arrivals: inter-arrival ~ Exp(rate)
+    delays = [rng.expovariate(request_rate) for _ in range(len(prompts))]
+    delays = [sum(delays[:i + 1]) for i in range(len(delays))]  # schedule times
+    await asyncio.gather(*[one(i, delays[i]) for i in range(len(prompts))])
     return stats, time.perf_counter() - start
 
 

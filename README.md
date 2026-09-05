@@ -1,8 +1,55 @@
-# mini-vLLM v0.3 — From-Scratch LLM Inference Runtime
+# mini-vLLM v0.4 — From-Scratch LLM Inference **Serving** Runtime
 
 [![CI](https://github.com/WJX3078/mini-vllm/actions/workflows/ci.yml/badge.svg)](https://github.com/WJX3078/mini-vllm/actions/workflows/ci.yml)
 
-一个为**学习推理系统**而写的迷你 vLLM，基于 Qwen2.5-0.5B。v0.2 完成了调度与正确性；**v0.3 深入 GPU runtime**：Triton PagedAttention kernel、GPU 原生采样、KV 容量预留/物理分配解耦、持久化 metadata、逐阶段 runtime profiler——每一层都带正确性测试与真机数据。
+一个为**学习推理系统**而写的迷你 vLLM，基于 Qwen2.5-0.5B。
+v0.2 调度与正确性 → v0.3 GPU runtime（Triton PagedAttention / GPU 采样 /
+KV reservation）→ **v0.4 Production-style Serving**：AsyncLLMEngine、
+OpenAI 兼容 HTTP API、SSE 流式、取消/背压/可观测性/HTTP serving benchmark。
+
+```
+HTTP (OpenAI API)
+  │  POST /v1/completions · /v1/chat/completions（stream=true/false）
+  ▼
+AsyncLLMEngine ──────────── 单 GPU 线程，唯一 step() 所有者
+  │  bounded input queue ── 满 → 429（背压）
+  │  per-request bounded output queue ── 慢客户端 → 取消隔离（不丢 token）
+  ▼
+Continuous Batching Scheduler（token budget · chunked prefill · KV reservation）
+  ▼
+Paged KV + Triton PagedAttention + GPU-native Sampling
+  ▼
+增量 detokenizer → SSE（data: {...} / data: [DONE]）→ Client
+```
+
+```bash
+pip install -e ".[serve]"
+python -m minivllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-0.5B
+
+curl http://localhost:8000/v1/completions -H "Content-Type: application/json"   -d '{"prompt": "1, 2, 3,", "max_tokens": 8, "temperature": 0}'
+# → {"choices":[{"text":" 4, 5, 6","finish_reason":"length"}], "usage": {...}}
+
+curl -N http://localhost:8000/v1/completions -H "Content-Type: application/json"   -d '{"prompt": "hi", "max_tokens": 16, "stream": true}'     # SSE 流式
+```
+
+关键 serving 语义（全部有测试）：
+* **HTTP 永不绕过调度器**：所有请求进同一个 continuous-batching 引擎线程；
+* **取消**：客户端断开 / 超时 / 显式 abort → KV 释放、reservation 清零、
+  前缀 refcount 递减，全部幂等（12 个取消回归测试直接断言块管理不变量）；
+* **背压**：入口 bounded queue（429）+ 每请求 bounded 输出队列
+  （慢客户端被取消而非阻塞 GPU，计入 `slow_client_cancellations_total`）；
+* **可观测**：/metrics（Prometheus 文本：request/scheduler/KV/prefix +
+  TTFT/E2E 分位数）、/health、/ready、结构化日志（不打 prompt 正文）；
+* 增量 detokenizer：有界窗口 + 稳定边界校验，部分 UTF-8 尾部持有，
+  流式文本 == 非流式文本（CJK/emoji 拆字测试）。
+
+设计文档：[docs/V0_4_SERVING_DESIGN.md](docs/V0_4_SERVING_DESIGN.md) ·
+Adversarial Review：[docs/V0_4_REVIEW.md](docs/V0_4_REVIEW.md) ·
+Benchmark：[docs/V0_4_BENCHMARK.md](docs/V0_4_BENCHMARK.md)
+
+---
+
+## 引擎与 GPU Runtime（v0.2/v0.3 能力，v0.4 serving 的地基）
 
 ## GPU Runtime 架构（v0.3）
 

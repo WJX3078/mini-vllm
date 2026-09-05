@@ -105,7 +105,23 @@ async def _collect(ctx, req, ext_rid, created, kind, prompt_tokens):
     start = time.perf_counter()
     outputs: dict[int, dict] = {}
     finish_reason = None
-    async for d in ctx.engine.stream(req.request_id):
+    stream_iter = ctx.engine.stream(req.request_id).__aiter__()
+    while True:
+        try:
+            if ctx.request_timeout is not None:
+                remaining = ctx.request_timeout - (time.perf_counter() - start)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                d = await asyncio.wait_for(stream_iter.__anext__(), remaining)
+            else:
+                d = await stream_iter.__anext__()
+        except asyncio.TimeoutError:
+            await ctx.engine.abort_request(req.request_id)
+            ctx.metrics.inc("requests_timeout_total")
+            return JSONResponse(error_body("request timed out", "timeout",
+                                           408), status_code=408)
+        except StopAsyncIteration:
+            break
         slot = outputs.setdefault(d["sample_idx"],
                                   {"token_ids": [], "text": ""})
         slot["token_ids"].extend(d["token_ids"])

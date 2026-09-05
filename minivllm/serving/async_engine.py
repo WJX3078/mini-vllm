@@ -65,6 +65,7 @@ class _EngineCommand:
     params: SamplingParams | None = None
     prompt: list[int] | None = None
     target_request_id: str | None = None
+    internal_id: int | None = None        # set when the id is already known
     reply: queue.Queue = field(default_factory=queue.Queue)
 
 
@@ -184,9 +185,12 @@ class AsyncLLMEngine:
         finally:
             self.requests.pop(request_id, None)
             if not finished:
-                # consumer went away (GeneratorExit / timeout): stop the GPU
+                # consumer went away (GeneratorExit / timeout): stop the
+                # GPU; the internal id MUST ride along because the registry
+                # entry was just popped
                 self._cmd_queue.put(_EngineCommand(
-                    kind="abort", target_request_id=request_id))
+                    kind="abort", target_request_id=request_id,
+                    internal_id=req.internal_id))
                 self._wake.set()
 
     async def generate(self, prompt, params: SamplingParams) -> AsyncIterator:
@@ -259,9 +263,9 @@ class AsyncLLMEngine:
             if cmd.kind == "shutdown":
                 return
             if cmd.kind == "abort":
-                iid = self._internal_id(cmd.target_request_id)
-                print(f"[async] abort cmd for {cmd.target_request_id} "
-                      f"-> internal {iid}")
+                iid = cmd.internal_id \
+                    if cmd.internal_id is not None \
+                    else self._internal_id(cmd.target_request_id)
                 self.engine.abort_request(iid if iid is not None else -1)
                 continue
             # add
